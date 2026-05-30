@@ -288,13 +288,18 @@ class MegakernelTTS:
         max_new = self.config.max_new_tokens
         eos = self.config.eos_token_id
 
+        import torch  # local import to keep stub-mode importable without GPU
+        device = self.config.device
         for _ in range(max_new):
             next_tok = self._talker.step(prev_tok)
             if next_tok == eos:
                 break
 
-            # code_predictor: talker semantic token id -> 16 codebook token ids
-            code_frame = self._code_predictor(next_tok)
+            # code_predictor expects a (B, T) LongTensor of talker token ids.
+            # Decoder.step returns a Python int -- wrap it as shape (1, 1).
+            tok_tensor = torch.tensor([[next_tok]], dtype=torch.long, device=device)
+            # code_predictor: -> (1, 1, 16) codebook token ids
+            code_frame = self._code_predictor(tok_tensor)
             # codec: 16 codebook token ids -> 1920 int16 samples (3840 bytes)
             pcm_bytes = self._codec(code_frame)
 

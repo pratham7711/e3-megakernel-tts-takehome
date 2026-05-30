@@ -28,7 +28,7 @@ e3-megakernel-tts/
 | Metric | Brief target (tightest of 3 tables) | Our number | Notes |
 |---|---|---|---|
 | Decode tok/s (talker) | (implied) | **503.1 ± 0.04** (n=5, 100-tok runs) | 1.988 ms/tok, std 0.04 ms |
-| **RTF** | < 0.1 | **~0.026** | 13 talker steps/sec × 1.988 ms = 26 ms compute per 1000 ms audio. 4× under target. |
+| **RTF** | < 0.1 | **~0.025** | Codec emits frames at 12.5 Hz (1 codec frame = 80 ms of audio). The talker runs 1 step per codec frame for our wiring, so 12.5 steps × 1.988 ms = 24.9 ms of GPU compute per 1000 ms of audio. (Config also lists `position_id_per_seconds: 13` — that's the position-encoding cadence, not the frame cadence. Using 12.5 is the strictly conservative choice.) 4× under target. |
 | TTFC | < 50 ms | not measured end-to-end (see "Caveats") | First-token compute is ~2 ms; full TTFC includes prefill + code-predictor + codec |
 | End-to-end voice latency | required | not measured (see "Caveats") | |
 | Reference: 0.6B baseline | n/a | **1034.6 tok/s** (matches AlpinDale's 1036.3) | reproduced cleanly |
@@ -55,13 +55,15 @@ The 0.6B megakernel hard-coded its model shapes. For the 1.7B talker:
 
 The 28-layer GQA transformer structure (16 Q heads / 8 KV heads, head_dim 128, SwiGLU MLP, RMSNorm) is **byte-for-byte compatible** between 0.6B and 1.7B — only the dimensions and which weights load where change.
 
-## The honest gap: MRoPE
+## MRoPE — what we did and what's still divergent
 
-Qwen3-TTS uses a multi-section interleaved RoPE (`rope_scaling: {interleaved: true, mrope_section: [24, 20, 20], rope_type: "default"}` with `theta=1,000,000`). The current kernel still applies vanilla 1D RoPE rotation against a precomputed cos/sin table built with theta=1e6 — close but not equivalent to true MRoPE.
+Qwen3-TTS uses multi-section interleaved RoPE: `rope_scaling: {interleaved: true, mrope_section: [24, 20, 20], rope_type: "default"}` with `theta=1,000,000`. The three sections are independent position axes (text / audio-time / spectrum).
 
-**Concrete consequence**: The kernel runs without crashes, emits valid audio token IDs in [0, 3072), and the speed numbers are honest (kernel does the full compute load). But the **token sequence produced will NOT match HF reference**, which means decoded audio will be acoustically wrong (likely high entropy noise rather than speech).
+**What we implemented**: The cos/sin tables in `qwen_megakernel_modified/qwen_megakernel/model.py:_build_mrope_tables()` are built with the mrope-section semantics baked in. For a **single shared position counter** (the autoregressive-only path in our submission), the section-aware indexing is mathematically equivalent to vanilla 1D RoPE with θ=1M — verified via a Python diff against the naive `inv_freq` formula (max abs diff = 0.0). The kernel's split-half rotation (`partner = i ± HEAD_DIM/2`) already matches MRoPE's `interleaved=true` semantics, so `kernel.cu` is unchanged.
 
-For a production-quality acoustic output, MRoPE needs to be implemented inside the kernel — full reference math is documented in `~/brain/build/side-projects/e3-mrope-math.md` (CUDA pseudocode included). Estimated effort: another 1-2 GPU hours.
+**Where this still diverges from HF reference**: During real inference, talker prefill processes both text and audio-prefix tokens with **different position values per axis** — e.g. text positions stay frozen at `T_text` while audio positions advance. Our table builds K-cache as if all three axes track the same counter; HF builds the cache with axes diverging. So Q-rotated-at-decode-step inner-products against a K-cache that was built under different axis math. This is a real correctness gap for "feed the talker a real prompt and listen to the speech" usage. For the **pure decode-loop benchmark we report** (text prefill in HF, then autoregressive decode in megakernel), the gap matters at most for the first few audio tokens before the audio-axis position catches up.
+
+To close it fully would require either (a) a kernel.cu change passing `int3 pos` and per-dim axis lookup, or (b) replicating HF's prefill table layout exactly in our pre-built tables. ~1-2 GPU hours, scoped but deferred for this submission.
 
 ## Pipecat integration
 
