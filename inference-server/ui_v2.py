@@ -138,7 +138,7 @@ def load_components() -> LoadedComponents:
 
     try:
         comps.talker = Decoder(model_path=MODEL_PATH, verbose=False)
-        comps.code_predictor, comps.codec = _load(
+        comps.code_predictor, comps.codec, _ = _load(
             weights_dir=MODEL_PATH,
             device="cuda",
             dtype=torch.bfloat16,
@@ -609,10 +609,23 @@ def _history_row(m: RunMetrics) -> list[Any]:
     ]
 
 
-def prepend_history(history: list[list[Any]] | None, m: RunMetrics) -> list[list[Any]]:
-    history = list(history or [])
-    history.insert(0, _history_row(m))
-    return history[:MAX_HISTORY]
+def prepend_history(history, m: RunMetrics) -> list[list[Any]]:
+    """Prepend a new run-history row. Defensive against the many shapes Gradio's
+    Dataframe component hands back depending on version: None, list[list[Any]],
+    or pandas.DataFrame. Truthiness checks must avoid ``or`` on DataFrames
+    (their __bool__ raises). Empty DataFrames have ``.empty`` True; we route
+    by attribute rather than truthiness.
+    """
+    rows: list[list[Any]]
+    if history is None:
+        rows = []
+    elif hasattr(history, "values") and hasattr(history, "empty"):
+        # pandas DataFrame
+        rows = [] if history.empty else history.values.tolist()
+    else:
+        rows = list(history)
+    rows.insert(0, _history_row(m))
+    return rows[:MAX_HISTORY]
 
 
 # -----------------------------------------------------------------------------

@@ -21,34 +21,34 @@ project the final hidden to 16 sets of vocab-2048 logits. The forward takes
 ``talker_token_ids: (B, T)`` Long and returns ``(B, T, 16)`` codebook ids.
 The implementation is greedy argmax; sampling can be added on top.
 
-What's stubbed (CLEARLY MARKED)
--------------------------------
-:class:`Code2WavCodec` -- the real Qwen3TTSTokenizerV2Model decoder is a
-496-key non-DiT causal-ConvNet + 8-layer transformer hybrid. Reverse-
-engineering the exact ConvNet topology from the safetensors keys alone
-(``decoder.decoder.0.conv.*``, ``decoder.decoder.1.block.0.alpha/beta``,
-SnakeBeta activations, residual stack ordering, transpose-conv strides) is
-not feasible without the upstream source for this brief. The stub here
-takes ``(B, T, 16)`` codebook ids and synthesises a recognisable test
-signal: a sine wave whose frequency is modulated by the mean of the 16
-codebook ids per frame. Each input frame produces ``1920`` int16 samples
-at 24 kHz (matches ``decode_upsample_rate``).
+:class:`Code2WavCodec` -- REAL ``Qwen3TTSTokenizerV2Decoder`` reimplemented in
+plain torch (no transformers PreTrainedModel boilerplate, no torchaudio).
+Pipeline:
 
-Look for ``# STUB: replace with full codec reverse-engineering``.
+    codes (B, T, 16)  -> [transpose to (B, 16, T)]
+      -> SplitResidualVQ.decode -> (B, 512, T) latent
+      -> CausalConv pre_conv (512 -> 1024, kernel 3)
+      -> permute (B, T, 1024)
+      -> input_proj (1024 -> 512)
+      -> 8-layer transformer (hidden 512, 16 heads x 64, GQA = 16,
+         sliding-window causal attention with window=72, RoPE theta=1e4,
+         SwiGLU MLP intermediate=1024, RMSNorm, per-block LayerScale)
+      -> output_proj (512 -> 1024)
+      -> permute (B, 1024, T)
+      -> 2x [CausalTransConv stride 2 + ConvNeXtBlock]   (T -> 4T)
+      -> CausalConv 7 (1024 -> 1536)
+      -> 4 DecoderBlocks (upsample rates 8, 5, 4, 3) -> (B, 96, 480*4T)
+      -> SnakeBeta(96) -> CausalConv 7 (96 -> 1) -> (B, 1, 1920*T) PCM in [-1, 1]
 
-Honest limitation
------------------
-With this file alone you can:
-    - load the code predictor weights from the real safetensors and produce
-      meaningful 16-way codebook predictions from talker tokens,
-    - feed those codebook ids through the stub decoder and get test-tone
-      bytes that prove the integration surface (shape, dtype, sample rate,
-      streaming chunk size) is correct.
+Total upsample factor: 2*2*8*5*4*3 = 1920 samples per input frame at 24 kHz,
+which matches ``speech_tokenizer/config.json``'s ``decode_upsample_rate``.
 
-You CANNOT produce intelligible speech until ``Code2WavCodec`` is replaced
-with the real ConvNet decoder. The integration tests (TTFC, chunk size,
-RTF measurement against silence) will pass; an A/B listening test will
-not. This is the documented tradeoff.
+Source attribution: structure mirrors
+``qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2.Qwen3TTSTokenizerV2Decoder``
+from the QwenLM/Qwen3-TTS GitHub repo, retargeted at the local torch only.
+Weights are loaded from ``speech_tokenizer/model.safetensors`` shipped with
+the Qwen3-TTS-12Hz-1.7B checkpoint; the codec keys all live under the
+``decoder.`` prefix in that file (encoder side is unused in TTS).
 
 Public API
 ----------
@@ -374,32 +374,538 @@ class CodePredictor(nn.Module):
 
 
 # ===========================================================================
-# Code2WavCodec -- STUB
+# Code2WavCodec -- REAL implementation
 # ===========================================================================
+#
+# Layout of the building blocks below mirrors the safetensors keys under
+# ``decoder.*`` in ``speech_tokenizer/model.safetensors``:
+#
+#   decoder.pre_transformer.input_proj.{weight,bias}     -- 1024 -> 512
+#   decoder.pre_transformer.layers.{0..7}.input_layernorm.weight
+#   decoder.pre_transformer.layers.{i}.self_attn.{q,k,v,o}_proj.weight
+#   decoder.pre_transformer.layers.{i}.self_attn_layer_scale.scale
+#   decoder.pre_transformer.layers.{i}.post_attention_layernorm.weight
+#   decoder.pre_transformer.layers.{i}.mlp.{gate,up,down}_proj.weight
+#   decoder.pre_transformer.layers.{i}.mlp_layer_scale.scale
+#   decoder.pre_transformer.norm.weight
+#   decoder.pre_transformer.output_proj.{weight,bias}    -- 512 -> 1024
+#
+#   decoder.pre_conv.conv.{weight,bias}                  -- CausalConv 512->1024 k=3
+#
+#   decoder.upsample.{0,1}.0.conv.{weight,bias}          -- CausalTransConv 1024->1024 k=2 s=2
+#   decoder.upsample.{0,1}.1.dwconv.conv.{weight,bias}   -- CausalConv 1024->1024 k=7 g=1024
+#   decoder.upsample.{0,1}.1.norm.{weight,bias}          -- LayerNorm(1024)
+#   decoder.upsample.{0,1}.1.pwconv1.{weight,bias}       -- Linear 1024 -> 4096
+#   decoder.upsample.{0,1}.1.pwconv2.{weight,bias}       -- Linear 4096 -> 1024
+#   decoder.upsample.{0,1}.1.gamma                       -- (1024,)
+#
+#   decoder.decoder.0.conv.{weight,bias}                 -- CausalConv 1024 -> 1536 k=7
+#   decoder.decoder.{1..4}.block.0.{alpha,beta}          -- SnakeBeta(in_dim)
+#   decoder.decoder.{1..4}.block.1.conv.{weight,bias}    -- CausalTransConv in->out k=2r s=r
+#   decoder.decoder.{1..4}.block.{2,3,4}.act{1,2}.{alpha,beta}
+#   decoder.decoder.{1..4}.block.{2,3,4}.conv{1,2}.conv.{weight,bias}
+#   decoder.decoder.5.{alpha,beta}                       -- final SnakeBeta(96)
+#   decoder.decoder.6.conv.{weight,bias}                 -- CausalConv 96 -> 1 k=7
+#
+#   decoder.quantizer.rvq_first.input_proj.weight        -- (256, 512, 1)  Conv1d 1x1
+#   decoder.quantizer.rvq_first.output_proj.weight       -- (512, 256, 1)
+#   decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage    (2048,)
+#   decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum    (2048, 256)
+#   decoder.quantizer.rvq_rest.input_proj.weight         -- (256, 512, 1)
+#   decoder.quantizer.rvq_rest.output_proj.weight        -- (512, 256, 1)
+#   decoder.quantizer.rvq_rest.vq.layers.{0..14}._codebook.*           (15 layers)
 
 
-class Code2WavCodec(nn.Module):
-    """STUB codec decoder. See file docstring.
+class _CausalConv1d(nn.Module):
+    """Causal 1D convolution -- pads ``(kernel-1)*dilation`` zeros on the left.
 
-    Real architecture: 8-layer transformer + non-DiT causal ConvNet with
-    SnakeBeta activations, 16-quantizer residual VQ, upsample ratio 1920.
-    The 496-key state dict structure is:
-        decoder.decoder.{0}.conv.weight, .bias                  -- entry conv
-        decoder.decoder.{1..K}.block.{0..N}.alpha/beta           -- SnakeBeta act
-        decoder.decoder.{1..K}.block.{0..N}.conv.weight/bias     -- residual stack
-        decoder.decoder.{1..K}.shortcut.conv.weight/bias         -- skip path
-        decoder.decoder.{...}.conv_transpose.weight/bias         -- upsamplers
-        encoder.* / quantizer.* / project_in.* / project_out.*   -- VQ side
-    Reverse-engineering this without the upstream modeling code is out of
-    scope; the stub below produces a recognisable test signal so we can
-    smoke-test the integration end-to-end.
+    Mirrors ``Qwen3TTSTokenizerV2CausalConvNet`` from the upstream qwen-tts
+    package.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        dilation: int = 1,
+        stride: int = 1,
+        groups: int = 1,
+    ) -> None:
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            dilation=dilation,
+            groups=groups,
+        )
+        self.stride = stride
+        self._effective_kernel = (kernel_size - 1) * dilation + 1
+        self._padding = self._effective_kernel - stride
+
+    def _extra_padding(self, hidden: torch.Tensor) -> int:
+        length = hidden.shape[-1]
+        n_frames = (length - self._effective_kernel + self._padding) / self.stride + 1
+        ideal_length = (math.ceil(n_frames) - 1) * self.stride + (self._effective_kernel - self._padding)
+        return ideal_length - length
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        extra = self._extra_padding(hidden)
+        hidden = F.pad(hidden, (self._padding, extra), mode="constant", value=0.0)
+        return self.conv(hidden).contiguous()
+
+
+class _CausalTransConv1d(nn.Module):
+    """Causal transposed 1D convolution.
+
+    The right-side trim ``kernel - stride`` removes the future-leaking tail
+    introduced by ConvTranspose1d's default zero-padding behaviour. Mirrors
+    ``Qwen3TTSTokenizerV2CausalTransConvNet`` from the upstream package.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1) -> None:
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride=stride)
+        self._right_pad = int(kernel_size - stride)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        hidden = self.conv(hidden)
+        if self._right_pad > 0:
+            hidden = hidden[..., : hidden.shape[-1] - self._right_pad]
+        return hidden.contiguous()
+
+
+class _SnakeBeta(nn.Module):
+    """``x + (1/beta) * sin(x*alpha)^2`` -- magnitude-aware Snake activation.
+
+    Alphas/betas are stored in log-space; they are exp'd at forward time.
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.alpha = nn.Parameter(torch.zeros(channels))
+        self.beta = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        # hidden: (B, C, T)
+        alpha = torch.exp(self.alpha).unsqueeze(0).unsqueeze(-1)
+        beta = torch.exp(self.beta).unsqueeze(0).unsqueeze(-1)
+        return hidden + (1.0 / (beta + 1e-9)) * torch.sin(hidden * alpha).pow(2)
+
+
+class _ConvNeXtBlock(nn.Module):
+    """Depthwise ConvNeXt block at the upsample stage (post-transformer)."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dwconv = _CausalConv1d(dim, dim, kernel_size=7, groups=dim, dilation=1)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, 4 * dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(torch.ones(dim) * 1e-6)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        identity = hidden
+        hidden = self.dwconv(hidden)
+        hidden = hidden.permute(0, 2, 1)
+        hidden = self.norm(hidden)
+        hidden = self.pwconv1(hidden)
+        hidden = self.act(hidden)
+        hidden = self.pwconv2(hidden)
+        hidden = self.gamma * hidden
+        hidden = hidden.permute(0, 2, 1)
+        return identity + hidden
+
+
+# --- Pre-transformer (sliding-window causal self-attention, 8 layers) -------
+
+# Pre-transformer dims (from safetensors / config.json decoder_config)
+PT_HIDDEN_SIZE = 512
+PT_NUM_LAYERS = 8
+PT_NUM_HEADS = 16
+PT_HEAD_DIM = 64  # PT_HIDDEN_SIZE / PT_NUM_HEADS not used; head_dim is explicit
+PT_INTERMEDIATE = 1024
+PT_LATENT_DIM = 1024
+PT_SLIDING_WINDOW = 72
+PT_ROPE_THETA = 10_000.0
+PT_RMS_EPS = 1e-5
+PT_LAYER_SCALE_INIT = 0.01
+
+
+class _PTLayerScale(nn.Module):
+    def __init__(self, channels: int = PT_HIDDEN_SIZE, init: float = PT_LAYER_SCALE_INIT) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.full((channels,), init))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scale * x
+
+
+class _PTMLP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(PT_HIDDEN_SIZE, PT_INTERMEDIATE, bias=False)
+        self.up_proj = nn.Linear(PT_HIDDEN_SIZE, PT_INTERMEDIATE, bias=False)
+        self.down_proj = nn.Linear(PT_INTERMEDIATE, PT_HIDDEN_SIZE, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _PTAttention(nn.Module):
+    """Sliding-window causal multi-head self-attention.
+
+    With ``num_attention_heads == num_key_value_heads == 16`` the GQA group is
+    1, so we don't have to repeat kv heads. SDPA does the causal mask; the
+    sliding window is enforced by clipping cos/sin and the attention mask is
+    built explicitly when ``T > window``.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        # Keep a single learnable scalar so the module has parameters and
-        # ``state_dict`` round-trips cleanly during integration tests.
-        self.placeholder = nn.Parameter(torch.zeros(1), requires_grad=False)
+        self.q_proj = nn.Linear(PT_HIDDEN_SIZE, PT_NUM_HEADS * PT_HEAD_DIM, bias=False)
+        self.k_proj = nn.Linear(PT_HIDDEN_SIZE, PT_NUM_HEADS * PT_HEAD_DIM, bias=False)
+        self.v_proj = nn.Linear(PT_HIDDEN_SIZE, PT_NUM_HEADS * PT_HEAD_DIM, bias=False)
+        self.o_proj = nn.Linear(PT_NUM_HEADS * PT_HEAD_DIM, PT_HIDDEN_SIZE, bias=False)
+        self._scale = 1.0 / math.sqrt(PT_HEAD_DIM)
+
+    def forward(
+        self,
+        x: torch.Tensor,  # (B, T, H)
+        cos: torch.Tensor,  # (T, head_dim)
+        sin: torch.Tensor,
+        sliding_mask: torch.Tensor | None,  # (T, T) bool or None
+    ) -> torch.Tensor:
+        B, T, _ = x.shape
+        q = self.q_proj(x).view(B, T, PT_NUM_HEADS, PT_HEAD_DIM).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, PT_NUM_HEADS, PT_HEAD_DIM).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, PT_NUM_HEADS, PT_HEAD_DIM).transpose(1, 2)
+
+        q, k = _apply_rope(q, k, cos, sin)
+
+        if sliding_mask is None:
+            attn = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self._scale)
+        else:
+            # sliding_mask is a (T, T) bool: True where the position is allowed
+            # to attend. We pass it as additive mask (-inf for disallowed).
+            attn = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=sliding_mask.unsqueeze(0).unsqueeze(0),  # (1, 1, T, T)
+                is_causal=False,
+                scale=self._scale,
+            )
+
+        attn = attn.transpose(1, 2).contiguous().view(B, T, PT_NUM_HEADS * PT_HEAD_DIM)
+        return self.o_proj(attn)
+
+
+class _PTLayer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_layernorm = RMSNorm(PT_HIDDEN_SIZE, eps=PT_RMS_EPS)
+        self.self_attn = _PTAttention()
+        self.self_attn_layer_scale = _PTLayerScale()
+        self.post_attention_layernorm = RMSNorm(PT_HIDDEN_SIZE, eps=PT_RMS_EPS)
+        self.mlp = _PTMLP()
+        self.mlp_layer_scale = _PTLayerScale()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        sliding_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        x = x + self.self_attn_layer_scale(self.self_attn(self.input_layernorm(x), cos, sin, sliding_mask))
+        x = x + self.mlp_layer_scale(self.mlp(self.post_attention_layernorm(x)))
+        return x
+
+
+class _PreTransformer(nn.Module):
+    """8-layer sliding-window causal transformer with input/output projections.
+
+    Per the upstream Qwen3TTSTokenizerV2DecoderTransformerModel:
+      - ``input_proj``: ``Linear(latent_dim=1024, hidden_size=512)``
+      - 8 transformer layers at hidden=512, h=16, head_dim=64, sliding_window=72
+      - final RMSNorm on hidden=512
+      - ``output_proj``: ``Linear(hidden_size=512, latent_dim=1024)``
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_proj = nn.Linear(PT_LATENT_DIM, PT_HIDDEN_SIZE)
+        self.layers = nn.ModuleList([_PTLayer() for _ in range(PT_NUM_LAYERS)])
+        self.norm = RMSNorm(PT_HIDDEN_SIZE, eps=PT_RMS_EPS)
+        self.output_proj = nn.Linear(PT_HIDDEN_SIZE, PT_LATENT_DIM)
+        self.register_buffer("_cos_table", torch.empty(0), persistent=False)
+        self.register_buffer("_sin_table", torch.empty(0), persistent=False)
+
+    def _ensure_rope(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
+        need = (
+            self._cos_table.numel() == 0
+            or self._cos_table.size(0) < seq_len
+            or self._cos_table.device != device
+            or self._cos_table.dtype != dtype
+        )
+        if need:
+            cos, sin = _build_mrope_cos_sin(
+                max(seq_len, 4096), PT_HEAD_DIM, PT_ROPE_THETA, device, dtype
+            )
+            self._cos_table = cos
+            self._sin_table = sin
+
+    @staticmethod
+    def _sliding_mask(T: int, window: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+        if T <= window:
+            return None
+        # additive mask: 0 where allowed, -inf where blocked
+        idx = torch.arange(T, device=device)
+        delta = idx.unsqueeze(0) - idx.unsqueeze(1)  # (T, T) -- j - i
+        # allowed if -window < j - i <= 0 (causal + within window steps back)
+        allowed = (delta <= 0) & (delta > -window)
+        mask = torch.zeros((T, T), device=device, dtype=dtype)
+        mask = mask.masked_fill(~allowed, float("-inf"))
+        return mask
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        # hidden: (B, T, latent=1024)
+        hidden = self.input_proj(hidden)
+        B, T, _ = hidden.shape
+        self._ensure_rope(T, hidden.device, hidden.dtype)
+        cos = self._cos_table[:T]
+        sin = self._sin_table[:T]
+        sliding_mask = self._sliding_mask(T, PT_SLIDING_WINDOW, hidden.device, hidden.dtype)
+        for layer in self.layers:
+            hidden = layer(hidden, cos, sin, sliding_mask)
+        hidden = self.norm(hidden)
+        hidden = self.output_proj(hidden)
+        return hidden
+
+
+# --- Quantizer (Euclidean codebook -> dequantize per-codebook embedding) ----
+
+
+class _EuclideanCodebook(nn.Module):
+    """Codebook stored as ``embedding_sum / cluster_usage``.
+
+    Matches the Moshi-/Mimi-style residual VQ. The actual embedding for a
+    code id is ``embedding_sum[code] / max(cluster_usage[code], epsilon)``.
+    """
+
+    def __init__(self, dim: int = 256, codebook_size: int = 2048, epsilon: float = 1e-5) -> None:
+        super().__init__()
+        self.dim = dim
+        self.codebook_size = codebook_size
+        self.epsilon = epsilon
+        self.cluster_usage = nn.Parameter(torch.ones(codebook_size))
+        self.embedding_sum = nn.Parameter(torch.zeros(codebook_size, dim))
+
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        embedding = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon).unsqueeze(-1)
+        return F.embedding(codes, embedding)
+
+
+class _VectorQuantization(nn.Module):
+    """Single VQ layer: codebook lookup + optional projection to outer dim."""
+
+    def __init__(self, dim: int = 256, codebook_size: int = 2048) -> None:
+        super().__init__()
+        self._codebook = _EuclideanCodebook(dim=dim, codebook_size=codebook_size)
+        # project_out is always Identity here -- the outer ResidualVectorQuantizer
+        # owns the input/output projections; per-layer there's no extra projection.
+        self.project_out = nn.Identity()
+
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        quantized = self._codebook.decode(codes)        # (B, T, dim) -- fp32
+        # Cast to the project_out / outer module dtype so downstream Conv1d
+        # works in whatever precision the codec was loaded in.
+        proj_dtype = next(self.project_out.parameters(), torch.empty(0, dtype=quantized.dtype)).dtype
+        if proj_dtype != quantized.dtype:
+            quantized = quantized.to(proj_dtype)
+        quantized = self.project_out(quantized)
+        quantized = quantized.transpose(1, 2)           # (B, dim, T)
+        return quantized
+
+
+class _ResidualVectorQuantizer(nn.Module):
+    """Stack of ``n_q`` codebooks summed in the residual.
+
+    Has 1x1 Conv1d input/output projections that map between the outer
+    ``input/output_dimension`` and the inner codebook ``dimension``. For the
+    Qwen3-TTS codec the inner dimension is 256 and the outer is 512 (per
+    ``codebook_dim = 512``).
+    """
+
+    def __init__(self, n_q: int, dim: int = 256, codebook_size: int = 2048,
+                 input_dim: int = 512, output_dim: int = 512) -> None:
+        super().__init__()
+        # The upstream code uses bias=False Conv1d 1x1 for these projections.
+        self.input_proj = nn.Conv1d(input_dim, dim, kernel_size=1, bias=False)
+        self.output_proj = nn.Conv1d(dim, output_dim, kernel_size=1, bias=False)
+        self.vq = nn.ModuleDict({
+            "layers": nn.ModuleList([_VectorQuantization(dim=dim, codebook_size=codebook_size) for _ in range(n_q)]),
+        })
+
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        """codes: (n_q, B, T) -- codebook id per layer per timestep.
+
+        Returns quantized: (B, output_dim, T).
+        """
+        # The upstream rvq layers don't use input_proj on decode (it's encoder-side);
+        # but they do apply output_proj. So decode sums up per-layer projected codes.
+        quantized = None
+        for idx, layer_codes in enumerate(codes):
+            layer = self.vq["layers"][idx]
+            q = layer.decode(layer_codes)  # (B, dim, T)
+            quantized = q if quantized is None else quantized + q
+        # Cast to output_proj's dtype (may have been moved to bf16/fp16).
+        proj_dtype = self.output_proj.weight.dtype
+        if proj_dtype != quantized.dtype:
+            quantized = quantized.to(proj_dtype)
+        # Apply output_proj at the end -- (B, dim, T) -> (B, output_dim, T).
+        return self.output_proj(quantized)
+
+
+class _SplitResidualVectorQuantizer(nn.Module):
+    """rvq_first (1 semantic codebook) + rvq_rest (15 acoustic codebooks)."""
+
+    def __init__(self, n_q: int = 16, n_q_semantic: int = 1,
+                 dim: int = 256, codebook_size: int = 2048,
+                 input_dim: int = 512, output_dim: int = 512) -> None:
+        super().__init__()
+        self.n_q_semantic = n_q_semantic
+        self.n_q_acoustic = n_q - n_q_semantic
+        self.rvq_first = _ResidualVectorQuantizer(
+            n_q=n_q_semantic, dim=dim, codebook_size=codebook_size,
+            input_dim=input_dim, output_dim=output_dim,
+        )
+        self.rvq_rest = _ResidualVectorQuantizer(
+            n_q=self.n_q_acoustic, dim=dim, codebook_size=codebook_size,
+            input_dim=input_dim, output_dim=output_dim,
+        )
+
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        """codes: (B, n_q=16, T) -- the encoder-emitted format."""
+        # Split semantic (idx 0) vs acoustic (idx 1..) along the codebook axis.
+        sem = codes[:, : self.n_q_semantic]            # (B, 1, T)
+        acoustic = codes[:, self.n_q_semantic:]        # (B, 15, T)
+        # Internal layer convention: (n_q, B, T).
+        sem_layers = sem.transpose(0, 1)              # (1, B, T)
+        acoustic_layers = acoustic.transpose(0, 1)    # (15, B, T)
+        quantized = self.rvq_first.decode(sem_layers)
+        if acoustic_layers.shape[0] > 0:
+            quantized = quantized + self.rvq_rest.decode(acoustic_layers)
+        return quantized  # (B, output_dim, T)
+
+
+# --- Decoder body (DecoderBlock = SnakeBeta + TransConv + 3 residual units) -
+
+
+class _DecoderResidualUnit(nn.Module):
+    def __init__(self, dim: int, dilation: int) -> None:
+        super().__init__()
+        self.act1 = _SnakeBeta(dim)
+        self.conv1 = _CausalConv1d(dim, dim, kernel_size=7, dilation=dilation)
+        self.act2 = _SnakeBeta(dim)
+        self.conv2 = _CausalConv1d(dim, dim, kernel_size=1)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        residual = hidden
+        hidden = self.act1(hidden)
+        hidden = self.conv1(hidden)
+        hidden = self.act2(hidden)
+        hidden = self.conv2(hidden)
+        return hidden + residual
+
+
+class _DecoderBlock(nn.Module):
+    """One upsampling decoder block.
+
+    Structure:
+      block.0  -- SnakeBeta(in_dim)
+      block.1  -- CausalTransConv(in_dim, out_dim, kernel=2r, stride=r)
+      block.2  -- DecoderResidualUnit(out_dim, dilation=1)
+      block.3  -- DecoderResidualUnit(out_dim, dilation=3)
+      block.4  -- DecoderResidualUnit(out_dim, dilation=9)
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, upsample_rate: int) -> None:
+        super().__init__()
+        self.block = nn.ModuleList([
+            _SnakeBeta(in_dim),
+            _CausalTransConv1d(in_dim, out_dim, kernel_size=2 * upsample_rate, stride=upsample_rate),
+            _DecoderResidualUnit(out_dim, dilation=1),
+            _DecoderResidualUnit(out_dim, dilation=3),
+            _DecoderResidualUnit(out_dim, dilation=9),
+        ])
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        for layer in self.block:
+            hidden = layer(hidden)
+        return hidden
+
+
+# --- Final glue: Code2WavCodec ---------------------------------------------
+
+
+CODEC_LATENT_DIM = 1024
+CODEC_CODEBOOK_DIM = 512        # outer dim of the RVQ (== rvq input/output)
+CODEC_CODEBOOK_INNER = 256      # inner codebook dim
+CODEC_DECODER_DIM = 1536
+CODEC_UPSAMPLE_RATES = (8, 5, 4, 3)
+CODEC_UPSAMPLING_RATIOS = (2, 2)
+
+
+class Code2WavCodec(nn.Module):
+    """Real Qwen3TTSTokenizerV2 decoder, plain torch, no transformers.
+
+    Forward accepts the talker-side ``(B, T, 16)`` codebook ids that the
+    :class:`CodePredictor` emits and returns a ``bytes`` payload containing
+    int16 little-endian PCM at 24 kHz. Each input frame upsamples to
+    ``CODEC_FRAME_UPSAMPLE == 1920`` samples (80 ms at 24 kHz, matching the
+    12.5 Hz codec frame rate).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.quantizer = _SplitResidualVectorQuantizer(
+            n_q=CODEC_NUM_QUANTIZERS,
+            n_q_semantic=1,
+            dim=CODEC_CODEBOOK_INNER,
+            codebook_size=CODEC_CODEBOOK_SIZE,
+            input_dim=CODEC_CODEBOOK_DIM,
+            output_dim=CODEC_CODEBOOK_DIM,
+        )
+        self.pre_conv = _CausalConv1d(CODEC_CODEBOOK_DIM, CODEC_LATENT_DIM, kernel_size=3)
+        self.pre_transformer = _PreTransformer()
+
+        # Upsample stages (post-transformer).
+        ups: list[nn.Module] = []
+        for factor in CODEC_UPSAMPLING_RATIOS:
+            ups.append(nn.ModuleList([
+                _CausalTransConv1d(CODEC_LATENT_DIM, CODEC_LATENT_DIM, kernel_size=factor, stride=factor),
+                _ConvNeXtBlock(CODEC_LATENT_DIM),
+            ]))
+        self.upsample = nn.ModuleList(ups)
+
+        # Decoder body.
+        decoder: list[nn.Module] = []
+        decoder.append(_CausalConv1d(CODEC_LATENT_DIM, CODEC_DECODER_DIM, kernel_size=7))
+        for i, rate in enumerate(CODEC_UPSAMPLE_RATES):
+            in_dim = CODEC_DECODER_DIM // (2 ** i)
+            out_dim = CODEC_DECODER_DIM // (2 ** (i + 1))
+            decoder.append(_DecoderBlock(in_dim, out_dim, rate))
+        output_dim = CODEC_DECODER_DIM // (2 ** len(CODEC_UPSAMPLE_RATES))
+        decoder.append(_SnakeBeta(output_dim))
+        decoder.append(_CausalConv1d(output_dim, 1, kernel_size=7))
+        self.decoder = nn.ModuleList(decoder)
+
         self._sample_rate = CODEC_OUTPUT_SAMPLE_RATE
         self._samples_per_frame = CODEC_FRAME_UPSAMPLE
 
@@ -412,15 +918,51 @@ class Code2WavCodec(nn.Module):
         return self._samples_per_frame
 
     @torch.no_grad()
-    def forward(self, codebook_ids: torch.Tensor) -> bytes:
-        """STUB: replace with full codec reverse-engineering.
+    def decode_to_waveform(self, codes: torch.Tensor) -> torch.Tensor:
+        """Decode ``codes (B, n_q=16, T)`` Long to waveform ``(B, samples)`` float.
 
-        Maps each frame's 16-codebook ids to a per-frame audible frequency and
-        emits ``CODEC_FRAME_UPSAMPLE`` int16 samples per input frame at 24 kHz.
+        Note: callers using the ``(B, T, 16)`` convention should transpose
+        first; :meth:`forward` does that conversion for the
+        ``code_predictor`` output shape.
+        """
+        if codes.dim() != 3 or codes.size(1) != CODEC_NUM_QUANTIZERS:
+            raise ValueError(
+                f"Expected codes of shape (B, {CODEC_NUM_QUANTIZERS}, T), got "
+                f"{tuple(codes.shape)}"
+            )
+        codes = codes.clamp(min=0, max=CODEC_CODEBOOK_SIZE - 1)
+
+        # Quantizer expects long codes; run the rest in the same dtype as the
+        # module parameters (the safetensors are loaded in fp32; the module
+        # itself can be cast to bf16/fp16 via .to() at load time).
+        hidden = self.quantizer.decode(codes.long())    # (B, codebook_dim=512, T)
+        # The codebook embedding lookup will produce float32 from the embedding
+        # parameters; convert to the module's working dtype.
+        param_dtype = next(self.pre_conv.parameters()).dtype
+        hidden = hidden.to(param_dtype)
+
+        hidden = self.pre_conv(hidden)                  # (B, latent=1024, T)
+        hidden = hidden.transpose(1, 2)                 # (B, T, 1024)
+        hidden = self.pre_transformer(hidden)           # (B, T, 1024)
+        hidden = hidden.permute(0, 2, 1)                # (B, 1024, T)
+
+        for blocks in self.upsample:
+            for block in blocks:
+                hidden = block(hidden)
+
+        wav = hidden
+        for layer in self.decoder:
+            wav = layer(wav)
+
+        return wav.clamp(min=-1.0, max=1.0).squeeze(1)  # (B, samples)
+
+    @torch.no_grad()
+    def forward(self, codebook_ids: torch.Tensor) -> bytes:
+        """Encode talker codebook ids to int16 LE PCM bytes at 24 kHz.
 
         Args:
-            codebook_ids: Long tensor of shape ``(B, T, 16)`` (B=1 is the only
-                tested batch size; we concat over T in the time axis).
+            codebook_ids: Long tensor of shape ``(B, T, 16)`` (B=1 typical;
+                ``T`` is the number of codec frames, each 80 ms).
 
         Returns:
             ``bytes`` -- int16 LE PCM at 24 kHz, length ``B*T*1920*2`` bytes.
@@ -431,33 +973,15 @@ class Code2WavCodec(nn.Module):
                 f"{tuple(codebook_ids.shape)}"
             )
 
-        ids = codebook_ids.detach().to("cpu", dtype=torch.float32).numpy()
-        B, T, _ = ids.shape
+        # (B, T, 16) -> (B, 16, T) is the upstream codec convention.
+        codes = codebook_ids.transpose(1, 2).contiguous()
+        wav = self.decode_to_waveform(codes)            # (B, samples) float [-1, 1]
 
-        # STUB: replace with full codec reverse-engineering
-        # Mean codebook id per frame -> frequency in [120 Hz, 2 kHz].
-        mean_per_frame = ids.mean(axis=-1)  # (B, T)
-        freqs = 120.0 + (mean_per_frame / float(CP_CODEBOOK_VOCAB - 1)) * (2000.0 - 120.0)
-
-        out_chunks: list[bytes] = []
-        phase = 0.0
-        sr = float(self._sample_rate)
-        for b in range(B):
-            for t in range(T):
-                f = float(freqs[b, t])
-                n = self._samples_per_frame
-                t_axis = np.arange(n, dtype=np.float32) / sr
-                samples = np.sin(2.0 * math.pi * f * t_axis + phase)
-                phase = (phase + 2.0 * math.pi * f * (n / sr)) % (2.0 * math.pi)
-                # Apply a soft envelope at the frame boundary to avoid clicks.
-                env = np.ones(n, dtype=np.float32)
-                ramp = min(64, n)
-                env[:ramp] = np.linspace(0.0, 1.0, ramp, dtype=np.float32)
-                env[-ramp:] = np.linspace(1.0, 0.0, ramp, dtype=np.float32)
-                samples = samples * env * 0.25  # quiet test tone
-                pcm = np.clip(samples, -1.0, 1.0)
-                out_chunks.append((pcm * 32767.0).astype(np.int16).tobytes())
-        return b"".join(out_chunks)
+        # Concat along batch -- callers always pass B=1 from ui_v2.
+        wav = wav.reshape(-1)
+        pcm = (wav.detach().to(torch.float32).clamp(-1.0, 1.0) * 32767.0).round()
+        pcm = pcm.to(torch.int16).cpu().numpy()
+        return pcm.tobytes()
 
 
 # ===========================================================================
@@ -564,30 +1088,95 @@ def _load_code_predictor(state: dict, dtype: torch.dtype, device: torch.device) 
     return cp, unaccounted
 
 
-def _load_codec(weights_dir: str, dtype: torch.dtype, device: torch.device) -> Tuple[Code2WavCodec, list[str]]:
-    """Load the codec decoder. STUB: we don't actually consume the weights.
+# Codec-side key mapping. The safetensors stores all codec weights under
+# ``decoder.*``; our module mirrors that subtree minus the redundant
+# ``decoder.`` prefix (so e.g. ``decoder.pre_transformer.layers.0.X`` in the
+# safetensors becomes ``pre_transformer.layers.0.X`` in our module).
+#
+# Two structural remappings the safetensors uses that our module doesn't:
+#   - The codebook is at ``decoder.quantizer.rvq_first.vq.layers.{i}._codebook.*``
+#     and we use ``quantizer.rvq_first.vq.layers.{i}._codebook.*`` -- a leading
+#     ``decoder.`` strip handles that automatically.
+#   - The safetensors codebook param name is ``embedding_sum``; the upstream
+#     code calls it ``embedding_sum`` too. No remap needed.
 
-    We still verify the file exists and surface its config so the caller can
-    sanity-check the sample rate / upsample ratio.
+
+def _remap_codec_keys(real_sd: dict) -> dict:
+    """Return a new state dict with codec keys remapped onto our module layout.
+
+    Removes the leading ``decoder.`` prefix and skips any encoder-side keys
+    (which the codec doesn't use during TTS).
     """
-    codec = Code2WavCodec().to(device=device, dtype=dtype)
+    out: dict = {}
+    for k, v in real_sd.items():
+        if not k.startswith("decoder."):
+            continue
+        new_key = k[len("decoder."):]
+        out[new_key] = v
+    return out
+
+
+def _load_codec(weights_dir: str, dtype: torch.dtype, device: torch.device) -> Tuple[Code2WavCodec, list[str]]:
+    """Instantiate :class:`Code2WavCodec` and load real weights from disk.
+
+    Returns (module, unaccounted_keys).
+    """
+    codec = Code2WavCodec()
     cfg_path = os.path.join(weights_dir, "speech_tokenizer", "config.json")
     weights_path = os.path.join(weights_dir, "speech_tokenizer", "model.safetensors")
+
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
             cfg = json.load(f)
-        # If the config disagrees with our constants, prefer the config.
         codec._sample_rate = int(cfg.get("output_sample_rate", CODEC_OUTPUT_SAMPLE_RATE))
         codec._samples_per_frame = int(cfg.get("decode_upsample_rate", CODEC_FRAME_UPSAMPLE))
-    # STUB: we do not load model.safetensors -- record the keys we *would*
-    # need to consume so the caller can audit them.
+
     unaccounted: list[str] = []
-    if os.path.exists(weights_path):
-        try:
-            keys = list(load_file(weights_path, device="cpu").keys())
-            unaccounted = keys  # all keys are unaccounted in the stub
-        except Exception:
-            pass
+    if not os.path.exists(weights_path):
+        # No weights on disk -- return an uninitialised codec; the UI will
+        # surface the empty audio rather than silently passing.
+        codec = codec.to(device=device, dtype=dtype)
+        return codec, unaccounted
+
+    raw_sd = load_file(weights_path, device="cpu")
+    remapped = _remap_codec_keys(raw_sd)
+
+    # Two cosmetic adjustments before load_state_dict:
+    #
+    # 1. ``quantizer.rvq_*.vq.layers.{i}._codebook.embedding_sum`` is a
+    #    Parameter on the codebook -- the upstream code declares it as such
+    #    (nn.Parameter), so our state dict's key names line up exactly. No
+    #    remap needed.
+    # 2. ``quantizer.rvq_*.vq.layers.{i}._codebook.initialized`` is a 1-elem
+    #    buffer in the original code path. We don't track it (we always
+    #    consider the codebook initialised at inference time), so we strip
+    #    those entries from the load and report them as unaccounted-but-ok.
+
+    initialized_keys = [k for k in list(remapped.keys()) if k.endswith("._codebook.initialized")]
+    for k in initialized_keys:
+        remapped.pop(k, None)
+
+    # Our module wraps `vq` as a ModuleDict with key "layers" so that the
+    # ``decoder.quantizer.rvq_*.vq.layers.{i}`` keys round-trip cleanly through
+    # PyTorch's load_state_dict.
+    missing_keys, unexpected_keys = codec.load_state_dict(remapped, strict=False)
+
+    # Accept the ``initialized`` keys we deliberately stripped.
+    unaccounted = sorted(initialized_keys + list(unexpected_keys))
+
+    # Move to target device/dtype. The codebook ``embedding_sum`` and
+    # ``cluster_usage`` must stay in fp32 for stable dequantization; we cast
+    # only the rest of the module.
+    codec = codec.to(device=device, dtype=dtype)
+    # Re-cast codebook parameters back to fp32 -- they're division-heavy and
+    # bf16 loses too much precision on the per-code mean.
+    for name, p in codec.named_parameters():
+        if "_codebook." in name:
+            p.data = p.data.to(torch.float32)
+
+    if missing_keys:
+        # Report missing keys as part of the diagnostics (the caller logs them).
+        unaccounted.extend(f"MISSING: {k}" for k in missing_keys)
     return codec, unaccounted
 
 
@@ -625,7 +1214,7 @@ def load_components(
     info = {
         "unaccounted_code_predictor_keys": cp_unaccounted,
         "unaccounted_codec_keys": codec_unaccounted,
-        "codec_stubbed": True,
+        "codec_stubbed": False,
         "sample_rate": codec.sample_rate,
         "samples_per_frame": codec.samples_per_frame,
     }
