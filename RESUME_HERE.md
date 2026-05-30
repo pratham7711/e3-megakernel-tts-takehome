@@ -1,4 +1,4 @@
-# Resume marker — e3 take-home (2026-05-30 19:55 IST)
+# Resume marker — e3 take-home (2026-05-30 23:40 IST)
 
 > **Start here every new session.** Single source of truth for what's done, what's left, and how to continue.
 
@@ -6,12 +6,13 @@
 
 ## TL;DR — where we are
 
-- **Repo**: https://github.com/pratham7711/e3-megakernel-tts-takehome (public, HEAD `334349c`)
-- **Status**: ~95% done. **Last open item**: live GPU run + demo video.
-- **Deadline**: 2026-06-01 EOD (≈ 24 h from this marker)
+- **Repo**: https://github.com/pratham7711/e3-megakernel-tts-takehome (public, HEAD `a49cf7e`, **not yet pushed**)
+- **Status**: ~95% done. **Last open item**: live GPU run + demo video. Mac-side audio plumbing is now genuinely honest (was misleading before — see bug #9 below).
+- **Deadline**: 2026-06-01 EOD (~22 h from this marker)
 - **Spend so far**: ~$7.70 of $10 reimbursement budget. Budget headroom: ~$2.30 (≈ 75 min GPU at $1.755/hr).
 - **GPU**: instance `#38548758` is STOPPED. Disk preserved; one `vastai start instance 38548758` brings it back.
 - **Email**: drafted, only the `<VIDEO_LINK>` placeholder remains. Send-ready otherwise.
+- **Mac-side proof artifact**: `samples/bot_response_mac.wav` — 1.92 s of REAL bot speech via macOS `say` substitute, generated end-to-end through Pipecat (input WAV → Deepgram → Groq → mac_say TTS → BotAudioRecorder). Plays cleanly via `afplay`.
 
 ---
 
@@ -37,17 +38,20 @@ Run these from `~/Documents/Repositories/e3-megakernel-tts/`.
 
 - [ ] **2. Verify in browser** — open http://localhost:8080. Click Generate with the default text. **Expect**: audio should sound DIFFERENT from the previous run (this session committed the **semantic codebook 4096 fix** — the prior runs produced garbled audio because the semantic codebook was at random init). If the new audio still sounds broken, see `~/brain/build/side-projects/e3-final-code-review-2.md` for the next 8 LOW-severity findings.
 
-- [ ] **3. Run the live Pipecat e2e** — proves the brief's Step 3 and gives us the missing 4th metric (end-to-end latency):
+- [ ] **3. Run the live Pipecat e2e** — proves the brief's Step 3 and gives us the missing 4th metric (end-to-end latency). NOTE: `pipecat_demo.py` now parses `MEGAKERNEL_STUB` as `0|silence|mac_say` and accepts `FILE_MODE_DRAIN_S` / `FILE_MODE_IDLE_TIMEOUT_S` overrides — for the real GPU run leave `MEGAKERNEL_STUB` unset (default 0 = real megakernel):
   ```bash
   ssh e3-vast 'cd /workspace/inference-server && \
     SSL_CERT_FILE="$(python3 -c "import certifi; print(certifi.where())")" \
     INPUT_MODE=file \
     INPUT_WAV=../samples/user_utterance.wav \
     OUTPUT_WAV=../samples/bot_response_gpu.wav \
+    FILE_MODE_DRAIN_S=15 \
+    FILE_MODE_IDLE_TIMEOUT_S=45 \
     python3 pipecat_demo.py'
   scp e3-vast:/workspace/samples/bot_response_gpu.wav ./samples/
   ```
   **Note**: `SSL_CERT_FILE` is needed because Mac Python 3.13 ships without root CAs. On the remote box it may not be needed but it doesn't hurt.
+  **bot_response_gpu.wav must contain bot-only audio now** (the AudioBufferProcessor merge bug is fixed in this commit). If `BotAudioRecorder captured 0 bytes` shows in the log, the TTS pipeline is silent — investigate before declaring success.
 
 - [ ] **4. Capture end-to-end latency** — measure (mic-WAV-input timestamp) → (first PCM byte timestamp on output WAV). Add it to `bench_results.json`. Update README's Performance table to fill the "end-to-end latency" cell that's currently blank.
 
@@ -111,6 +115,13 @@ Run these from `~/Documents/Repositories/e3-megakernel-tts/`.
 | 6 | MED | `pipecat_demo.py:WavFileInputProcessor` | Used `.start()` hook removed in Pipecat 1.3.0 → pump never fired → e2e test timed out idle | Kick pump from `process_frame` on first `StartFrame` |
 | 7 | MED | Mac Python 3.13 stdlib | No root CAs by default → Deepgram/Groq HTTPS handshake fails with `SSL: CERTIFICATE_VERIFY_FAILED` | `export SSL_CERT_FILE="$(python3 -c 'import certifi; print(certifi.where())')"` before running |
 | 8 | MED | `ui_v2.py:prepend_history` | Truthy check on a pandas DataFrame raises `ValueError` | Route via `.empty` attribute |
+| 9 | **CRITICAL** | `pipecat_demo.py:AudioBufferProcessor` | Stock processor merges user + bot frames into ONE buffer. With stub TTS = silence, the saved `bot_response.wav` was the user's input echoed back — masquerading as bot output. The "smoke test validates TTS plumbing" claim was hollow. | New `BotAudioRecorder` FrameProcessor captures `TTSAudioRawFrame` only. Saved WAV is now genuinely bot-only. |
+| 10 | HIGH | `pipecat_demo.py:run` | `load_dotenv(override=True)` blocked shell env from overriding `.env` — couldn't switch to stub from CLI. | `override=False` |
+| 11 | HIGH | `megakernel_tts.py:__init__` | Silent fallback to stub on Decoder / load_components failure. Hid real init errors. | Removed try/except — failures RAISE. Opt-in stub via `stub=True` only. |
+| 12 | MED | `pipecat_demo.py:PipelineTask` | Default 5-min idle timeout made file-mode smoke tests painfully slow. | `idle_timeout_secs=30` + configurable drain via `FILE_MODE_DRAIN_S`. |
+| 13 | MED | `megakernel_tts_service.py` | `TTSSettings: NOT_GIVEN model/voice/language` validator error every run. | Pass `model/voice/language` to `super().__init__()`. |
+| 14 | NEW FEATURE | `megakernel_tts.py:_mac_say_generate` | No way to demo real bot audio on Mac (only silence or GPU). | Added `MEGAKERNEL_STUB=mac_say` mode: macOS `say` → 24 kHz int16 PCM → 80 ms frame chunks matching the real codec shape. End-to-end Mac demo confirmed. |
+| 15 | HIGH (UI) | `ui_loopback.py` | Gradio 6.15.2 vs 4.x target: `editable=True` default put mic widget into WaveSurfer trim mode (no Play button); `gr.Dataframe` silently dropped `list[list[str]]` returns. | `editable=False, interactive=True` on mic; dict return for Dataframe; `autoplay=True` on every output; Clear buttons; `show_progress="full"`. Verified PASS via Playwright. |
 
 ### Architecture decisions that paid off
 - **Scope megakernel to the talker only** (per brief) — keeping code_predictor + codec in PyTorch was the right call; let us iterate without rebuilding the kernel
