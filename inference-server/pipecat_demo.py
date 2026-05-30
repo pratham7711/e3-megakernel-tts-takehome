@@ -70,11 +70,17 @@ from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     EndFrame,
     Frame,
     InputAudioRawFrame,
     LLMRunFrame,
     StartFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -113,6 +119,7 @@ class BotAudioRecorder(FrameProcessor):
         self._sample_rate = sample_rate
         self._num_channels = num_channels
         self._chunks: list[bytes] = []
+        self._bot_speaking = False
 
     @property
     def total_bytes(self) -> int:
@@ -125,8 +132,22 @@ class BotAudioRecorder(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, TTSAudioRawFrame) and frame.audio:
+            # Synthesise BotStartedSpeakingFrame on the first TTS chunk in
+            # headless file mode — normally LocalAudioTransport.output()
+            # emits this when bot audio reaches the speakers, but we have no
+            # output transport here. Without it, UserBotLatencyObserver can't
+            # compute the canonical UserStopped→BotStarted e2e number.
+            if not self._bot_speaking:
+                self._bot_speaking = True
+                await self.push_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+                await self.push_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
             self._chunks.append(frame.audio)
         await self.push_frame(frame, direction)
+
+    async def cleanup(self) -> None:
+        if self._bot_speaking:
+            await self.push_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await super().cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +302,12 @@ class WavFileInputProcessor(FrameProcessor):
                 ms=int(frame_period_s * 1000),
             )
 
+            # Synthesise a clean user-turn boundary so UserBotLatencyObserver
+            # can fire in file mode. Without these the headless GPU run can't
+            # measure the brief's e2e metric (VADUserStopped → BotStarted).
+            await self.push_frame(VADUserStartedSpeakingFrame())
+            await self.push_frame(UserStartedSpeakingFrame())
+
             while True:
                 data = wf.readframes(chunk_frames)
                 if not data:
@@ -300,6 +327,12 @@ class WavFileInputProcessor(FrameProcessor):
 
                 if self._realtime:
                     await asyncio.sleep(frame_period_s)
+
+            # Mark end-of-user-turn for the latency observer. Pipecat fires
+            # on_latency_measured between VADUserStopped and BotStarted, so
+            # both halves of the boundary must be explicit in file mode.
+            await self.push_frame(VADUserStoppedSpeakingFrame())
+            await self.push_frame(UserStoppedSpeakingFrame())
 
         # Give the LLM + TTS time to react before tearing down. A production
         # build would wait on a TTSStoppedFrame; 12 s is enough for a Groq

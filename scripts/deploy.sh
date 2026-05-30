@@ -28,6 +28,19 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SSH_CONFIG="${HOME}/.ssh/config"
 REMOTE_PORT=8080
 
+# Prefer the working vastai CLI: the system one at ~/Library/Python/3.9/bin
+# is broken because the vastai package uses `match` (Python 3.10+ syntax)
+# and Python 3.9 can't parse it. The vastvenv binary at /tmp/vastvenv/bin
+# is Python 3.13 and works. Fall back to PATH if neither is present.
+if [[ -x "/tmp/vastvenv/bin/vastai" ]]; then
+    VASTAI="/tmp/vastvenv/bin/vastai"
+elif command -v vastai >/dev/null 2>&1; then
+    VASTAI="$(command -v vastai)"
+else
+    echo "[fatal] no working vastai CLI found" >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # CLI parsing
 # ---------------------------------------------------------------------------
@@ -58,7 +71,7 @@ require() {
     command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
 }
 
-require vastai
+# require vastai (uses $VASTAI from above)
 require ssh
 require rsync
 require jq
@@ -70,7 +83,7 @@ require sed
 
 if [[ "$ACTION" == "stop" ]]; then
     log "stopping instance ${INSTANCE_ID}"
-    vastai stop instance "${INSTANCE_ID}"
+    "$VASTAI" stop instance "${INSTANCE_ID}"
     log "stop request submitted"
     exit 0
 fi
@@ -81,7 +94,7 @@ if [[ "$ACTION" == "destroy" ]]; then
     if [[ "$confirm" != "destroy" ]]; then
         die "aborted"
     fi
-    vastai destroy instance "${INSTANCE_ID}"
+    "$VASTAI" destroy instance "${INSTANCE_ID}"
     log "destroy request submitted"
     exit 0
 fi
@@ -91,12 +104,12 @@ fi
 # ---------------------------------------------------------------------------
 
 log "starting Vast instance ${INSTANCE_ID}"
-vastai start instance "${INSTANCE_ID}" || warn "start returned non-zero (already running?)"
+"$VASTAI" start instance "${INSTANCE_ID}" || warn "start returned non-zero (already running?)"
 
 log "polling for actual_status=running"
 deadline=$(( $(date +%s) + 300 ))
 while :; do
-    status_json="$(vastai show instances --raw 2>/dev/null || echo '[]')"
+    status_json="$("$VASTAI" show instances --raw 2>/dev/null || echo '[]')"
     status="$(echo "$status_json" | jq -r --argjson id "$INSTANCE_ID" '.[] | select(.id == $id) | .actual_status // "missing"')"
     if [[ "$status" == "running" ]]; then
         log "instance is running"
