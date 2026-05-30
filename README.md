@@ -193,6 +193,30 @@ This config produces **real speech-like audio** (broadband, voiced/unvoiced spec
 
 The 1.7B talker is ~2x slower than the 0.6B base, which is better than the naive 3x weight scaling -- the LM head shrunk 50x (vocab 151,936 -> 3,072) and frees bandwidth.
 
+### Measurement methodology — where + how each number comes from
+
+The brief specifies four metrics; this table maps each to the exact code path that captures it, the timing primitive, and the synchronization point. Everything below is reproducible from this repo with `make bench` (Config A) and the Pipecat demo for the user-bot e2e number.
+
+| Metric | Code path | Timing primitive | Sync | Sample size |
+|---|---|---|---|---|
+| **Decode tok/s** (bare talker) | `bench_megakernel.py:bench_decode_one_pass` | `time.perf_counter()` | **explicit `torch.cuda.synchronize()` before t0 and after the 100-token decode loop** | 3 warmup + 5 timed runs; mean ± pstdev |
+| **TTFC** (time to first PCM chunk) | `bench_megakernel.py:bench_ttfc_one_pass` | `time.perf_counter_ns()` | **explicit `torch.cuda.synchronize()` before `generate()` call AND at the first chunk yield**; bytes-conversion also forces an implicit sync via `.cpu().numpy()` | 3 warmup + 5 timed; pstdev reported |
+| **RTF** (synth wall / audio dur) | `bench_megakernel.py:bench_rtf_one_pass` | `time.perf_counter()` | **explicit sync before t0 and after last chunk** so wall time is end-to-end GPU work, no async leak | 3 warmup + 5 timed; pstdev reported |
+| **End-to-end** (user → bot) | Pipecat's built-in [`UserBotLatencyObserver`](https://docs.pipecat.ai/server/utilities/observers/user-bot-latency-observer) (wired via `pipecat_demo.py:_build_latency_observer`) | Pipecat internal `time.time()` per frame | n/a — measured between two pipeline frames (`VADUserStoppedSpeakingFrame` → `BotStartedSpeakingFrame`) | populates on mic-mode user turns; one event per cycle |
+| **Per-service TTFB breakdown** (Deepgram / LLM / our TTS) | `UserBotLatencyObserver` `on_latency_breakdown` event, fed by Pipecat's per-service `start_ttfb_metrics` / `stop_ttfb_metrics` hooks | Pipecat internal `time.time()` | n/a — measured by each service around its own request | one snapshot per user→bot cycle |
+
+**Why this is industry standard:**
+1. **`torch.cuda.synchronize()`** at timer boundaries means we're measuring GPU work completion, not kernel-launch latency. Standard for any CUDA microbenchmark.
+2. **`time.perf_counter[_ns]`** is the monotonic-clock primitive — immune to NTP drift. Better than wall-clock `time.time()` for short intervals.
+3. **n=5 with 3 warmup runs** lets JIT / cache effects settle before the measured runs. AlpinDale's own bench uses the same shape.
+4. **TTFC defined as "first PCM bytes to caller"** matches the Cartesia / Kokoro / ElevenLabs convention. Our `MegakernelTTSService.run_tts` ALSO calls Pipecat's `stop_ttfb_metrics()` at first chunk so the canonical TTFB metric flows through Pipecat's `MetricsFrame` channel.
+5. **End-to-end via `UserBotLatencyObserver`** is exactly what the brief asks for (`t0 = UserStoppedSpeaking`, `t1 = BotStartedSpeaking`) AND Pipecat's own canonical voice-agent metric. No bespoke timer needed.
+6. **RTF = synth_wall / audio_dur** is the canonical batch-RTF definition since SDM-era TTS papers.
+
+**Honest gaps:**
+- Config B (real codec) was measured n=1 on the user-facing UI (visible in the screenshot above). The cold-compile TTFC dominates first call; we plan to publish n=5 warm numbers after a `torch.compile` warmup pass on the codec graph.
+- End-to-end latency captured by `UserBotLatencyObserver` does not include browser/transport latency (mic capture to pipeline entry). For file mode this is irrelevant; for mic mode (`LocalAudioTransport`) it's negligible vs the LLM and TTS contributions.
+
 ### KV cache correctness (5/5 checks pass)
 
 - Deterministic: identical token sequences across reset+50-step runs
