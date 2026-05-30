@@ -85,6 +85,10 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.frames.frames import TTSAudioRawFrame
+from pipecat.observers.user_bot_latency_observer import (
+    LatencyBreakdown,
+    UserBotLatencyObserver,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService
 
@@ -319,6 +323,90 @@ class WavFileInputProcessor(FrameProcessor):
             self._task = self.create_task(self._pump(), name="wav-input-pump")
 
 
+def _build_latency_observer(metrics_sink: list[dict]) -> UserBotLatencyObserver:
+    """Build a UserBotLatencyObserver wired to log + append per-cycle metrics.
+
+    Pipecat's built-in observer fires three events:
+    - ``on_latency_measured(observer, latency_seconds)`` once per user→bot
+      cycle, measured from ``VADUserStoppedSpeakingFrame`` to
+      ``BotStartedSpeakingFrame``. This is THE industry-standard voice-agent
+      end-to-end metric per the brief's Step 4 "log t0 at UserStoppedSpeaking,
+      t1 at BotStartedSpeaking" definition.
+    - ``on_latency_breakdown(observer, breakdown)`` with a ``LatencyBreakdown``
+      containing per-service TTFB metrics (Deepgram STT TTFB, LLM TTFB, our
+      ``MegakernelTTSService`` TTFB) when ``enable_metrics=True``.
+    - ``on_first_bot_speech_latency(observer, latency_seconds)`` once for the
+      greeting / first audio (client-connect → first bot speech).
+
+    Each event appends a dict to ``metrics_sink`` so the caller can dump JSON
+    after the pipeline shuts down, alongside ``bench_results.json``.
+    """
+    observer = UserBotLatencyObserver()
+
+    @observer.event_handler("on_latency_measured")
+    async def _on_latency(_obs, latency_seconds: float):
+        metrics_sink.append({"kind": "user_bot_latency_s", "value": latency_seconds})
+        logger.info(
+            "[E2E] UserStoppedSpeaking → BotStartedSpeaking: {ms:.0f} ms",
+            ms=latency_seconds * 1000.0,
+        )
+
+    @observer.event_handler("on_latency_breakdown")
+    async def _on_breakdown(_obs, breakdown: LatencyBreakdown):
+        ttfbs = [
+            {"processor": t.processor, "model": t.model, "ms": t.duration_secs * 1000.0}
+            for t in breakdown.ttfb
+        ]
+        metrics_sink.append({
+            "kind": "latency_breakdown",
+            "user_turn_secs": breakdown.user_turn_secs,
+            "ttfb": ttfbs,
+        })
+        for t in ttfbs:
+            logger.info(
+                "[E2E] per-service TTFB: {p}{model} = {ms:.0f} ms",
+                p=t["processor"], model=f" ({t['model']})" if t["model"] else "",
+                ms=t["ms"],
+            )
+
+    @observer.event_handler("on_first_bot_speech_latency")
+    async def _on_first(_obs, latency_seconds: float):
+        metrics_sink.append({"kind": "first_bot_speech_s", "value": latency_seconds})
+        logger.info("[E2E] first bot speech: {ms:.0f} ms", ms=latency_seconds * 1000.0)
+
+    return observer
+
+
+def _dump_metrics(metrics_sink: list[dict], out_path: str | None) -> None:
+    """Print the latency observer's metrics + optionally write to JSON.
+
+    The observer events fire as the pipeline runs; this just summarises at
+    teardown so the file-mode smoke test produces a single artifact the
+    reviewer can diff against the brief's targets.
+    """
+    if not metrics_sink:
+        logger.warning(
+            "[E2E] no latency metrics captured — was VADUserStoppedSpeakingFrame "
+            "ever emitted? Mic mode + a VAD analyzer + an actual user turn are required."
+        )
+        return
+    e2e_values = [m["value"] for m in metrics_sink if m.get("kind") == "user_bot_latency_s"]
+    if e2e_values:
+        logger.info(
+            "[E2E SUMMARY] user-bot latency n={n} mean={mean:.0f} ms min={mn:.0f} ms max={mx:.0f} ms",
+            n=len(e2e_values),
+            mean=sum(e2e_values) / len(e2e_values) * 1000.0,
+            mn=min(e2e_values) * 1000.0,
+            mx=max(e2e_values) * 1000.0,
+        )
+    if out_path:
+        import json
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(metrics_sink, f, indent=2)
+        logger.info("[E2E] wrote {n} metric events to {p}", n=len(metrics_sink), p=out_path)
+
+
 def _save_wav(path: str, audio: bytes, sample_rate: int, num_channels: int) -> None:
     """Write a 16-bit PCM WAV to disk."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -370,6 +458,9 @@ async def _run_mic_mode(stt, llm, tts, context, aggregators) -> None:
         ]
     )
 
+    metrics_sink: list[dict] = []
+    latency_observer = _build_latency_observer(metrics_sink)
+
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
@@ -377,6 +468,7 @@ async def _run_mic_mode(stt, llm, tts, context, aggregators) -> None:
             enable_usage_metrics=True,
             allow_interruptions=True,
         ),
+        observers=[latency_observer],
     )
 
     # Kick off with a greeting so the user knows the bot is alive.
@@ -386,7 +478,10 @@ async def _run_mic_mode(stt, llm, tts, context, aggregators) -> None:
     await task.queue_frames([LLMRunFrame()])
 
     runner = PipelineRunner()
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        _dump_metrics(metrics_sink, os.environ.get("METRICS_OUT"))
 
 
 async def _run_file_mode(stt, llm, tts, context, aggregators) -> None:
@@ -416,6 +511,9 @@ async def _run_file_mode(stt, llm, tts, context, aggregators) -> None:
         ]
     )
 
+    metrics_sink: list[dict] = []
+    latency_observer = _build_latency_observer(metrics_sink)
+
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
@@ -430,10 +528,14 @@ async def _run_file_mode(stt, llm, tts, context, aggregators) -> None:
         # the LLM+TTS path is the timeout-detection signal. 30s covers
         # Groq+TTS for a short reply with margin.
         idle_timeout_secs=float(os.environ.get("FILE_MODE_IDLE_TIMEOUT_S", "30.0")),
+        observers=[latency_observer],
     )
 
     runner = PipelineRunner()
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        _dump_metrics(metrics_sink, os.environ.get("METRICS_OUT"))
 
     if bot_recorder.total_bytes == 0:
         logger.warning(
