@@ -19,10 +19,11 @@ becomes a requirement.
 
 Env vars (loaded from ``.env``):
     DEEPGRAM_API_KEY=...
-    LLM_PROVIDER=anthropic   # or "openai"
+    LLM_PROVIDER=anthropic   # or "openai" or "groq"
     LLM_API_KEY=...          # used by whichever provider is selected
     LLM_MODEL=...            # optional override
     MEGAKERNEL_SPEAKER=ryan  # optional override
+    MEGAKERNEL_MODEL_PATH=/workspace/qwen3-tts-1.7b  # optional local path
     MEGAKERNEL_STUB=0        # set to 1 for plumbing smoke test (silence)
 
 Run::
@@ -94,8 +95,24 @@ def _build_llm() -> object:
             ),
         )
 
+    if provider == "groq":
+        # GroqLLMService is an OpenAI-compatible subclass shipped at
+        # pipecat.services.groq.llm.GroqLLMService; it inherits the
+        # ``Settings`` dataclass from BaseOpenAILLMService (model +
+        # system_instruction supported).
+        from pipecat.services.groq.llm import GroqLLMService
+
+        model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+        return GroqLLMService(
+            api_key=api_key,
+            settings=GroqLLMService.Settings(
+                model=model,
+                system_instruction=system_prompt,
+            ),
+        )
+
     raise ValueError(
-        f"Unknown LLM_PROVIDER={provider!r}. Use 'anthropic' or 'openai'."
+        f"Unknown LLM_PROVIDER={provider!r}. Use 'anthropic', 'openai', or 'groq'."
     )
 
 
@@ -125,6 +142,9 @@ async def run() -> None:
     tts = MegakernelTTSService(
         model_name=os.environ.get(
             "MEGAKERNEL_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+        ),
+        model_path=os.environ.get(
+            "MEGAKERNEL_MODEL_PATH", "/workspace/qwen3-tts-1.7b"
         ),
         speaker=speaker,
         device=os.environ.get("MEGAKERNEL_DEVICE", "cuda"),

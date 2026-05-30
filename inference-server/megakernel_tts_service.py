@@ -61,6 +61,7 @@ class MegakernelTTSService(TTSService):
         self,
         *,
         model_name: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        model_path: str = "/workspace/qwen3-tts-1.7b",
         speaker: str = "ryan",
         device: str = "cuda",
         stub: bool = False,
@@ -72,6 +73,9 @@ class MegakernelTTSService(TTSService):
         Args:
             model_name: HuggingFace Qwen3-TTS checkpoint id. Defaults to the
                 canonical ``Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice``.
+            model_path: Local on-disk path to the Qwen3-TTS weights directory.
+                Used by the megakernel ``Decoder`` and the code_predictor +
+                codec loader.
             speaker: Speaker / voice identifier, e.g. ``"ryan"``. Resolved to
                 a speaker-embedding tensor inside :class:`MegakernelTTS`.
             device: Torch device. Must be ``"cuda"`` for the megakernel path.
@@ -90,11 +94,13 @@ class MegakernelTTSService(TTSService):
         )
 
         self._model_name = model_name
+        self._model_path = model_path
         self._speaker = speaker
         self._device = device
 
         config = MegakernelTTSConfig(
             model_name=model_name,
+            model_path=model_path,
             speaker=speaker,
             device=device,
             stub=stub,

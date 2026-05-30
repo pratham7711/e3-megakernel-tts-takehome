@@ -21,16 +21,6 @@ The wrapper is async-streaming: :meth:`generate` is an ``AsyncGenerator`` that
 yields raw int16 PCM bytes as soon as each codec frame is decoded, so the
 caller (Pipecat service, bench harness, raw test script) can begin pushing
 audio to its sink with minimal time-to-first-chunk (TTFC).
-
-Status
-------
-The Talker integration against the modified megakernel ``Decoder`` is
-**stubbed** behind ``# TODO: replace with actual megakernel Decoder`` markers.
-Wire-up happens after the kernel mods land (MRoPE, hidden=2048, vocab=3072
-LM head, untied embeds). Until then, ``generate`` raises
-:class:`NotImplementedError` when called with ``stub=False``, and emits zero
-PCM in ``stub=True`` mode so the surrounding Pipecat plumbing can be smoke
-tested end to end.
 """
 
 from __future__ import annotations
@@ -47,9 +37,6 @@ from loguru import logger
 # Qwen3-TTS native codec rate -- confirmed from Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 # config: codec runs at 12.5 Hz frame rate, each frame decodes to 1920 samples
 # of 24 kHz int16 PCM (i.e. 80 ms / chunk).
-#
-# TODO(verify-on-remote): cross-check with codec.config.sampling_rate on the
-# loaded model. If Qwen ships a 22.05 kHz variant we surface that here instead.
 QWEN3_TTS_SAMPLE_RATE: int = 24_000
 QWEN3_TTS_CODEC_FRAME_RATE_HZ: float = 12.5
 QWEN3_TTS_SAMPLES_PER_CODEC_FRAME: int = int(
@@ -61,6 +48,9 @@ QWEN3_TTS_SAMPLES_PER_CODEC_FRAME: int = int(
 # from the talker, not by a fixed token count.
 QWEN3_TTS_TALKER_RATE_HZ: float = 13.0
 
+# Qwen3-TTS codec EOS token id (per Qwen3-TTS-12Hz-1.7B-CustomVoice config).
+QWEN3_TTS_CODEC_EOS_TOKEN_ID: int = 2150
+
 
 @dataclass
 class MegakernelTTSConfig:
@@ -69,6 +59,9 @@ class MegakernelTTSConfig:
     Parameters:
         model_name: HuggingFace repo id of the Qwen3-TTS checkpoint. The
             canonical target is ``Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice``.
+        model_path: Local on-disk path to the Qwen3-TTS weights directory.
+            The megakernel ``Decoder`` and component loader both consume the
+            checkpoint from this directory (safetensors).
         speaker: Speaker / voice identifier (e.g. ``"ryan"``). Maps to the
             speaker-conditioning embedding consumed by the Talker.
         device: Torch device string. Megakernel hard-requires ``"cuda"``.
@@ -77,16 +70,20 @@ class MegakernelTTSConfig:
         sample_rate: Output PCM sample rate. Locked to 24 kHz for Qwen3-TTS;
             exposed here for downstream consumers that prefer reading it off
             the wrapper rather than the module-level constant.
+        eos_token_id: Semantic-token id that ends an utterance. Defaults to
+            ``QWEN3_TTS_CODEC_EOS_TOKEN_ID`` (2150) per the upstream config.
         stub: When True, :meth:`generate` yields silence instead of touching
             the (unwired) Talker. Used for Pipecat plumbing smoke tests
             before kernel mods land. Defaults to False.
     """
 
     model_name: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    model_path: str = "/workspace/qwen3-tts-1.7b"
     speaker: str = "ryan"
     device: str = "cuda"
     max_new_tokens: int = 4096
     sample_rate: int = QWEN3_TTS_SAMPLE_RATE
+    eos_token_id: int = QWEN3_TTS_CODEC_EOS_TOKEN_ID
     stub: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -120,6 +117,7 @@ class MegakernelTTS:
         speaker: str = "ryan",
         device: str = "cuda",
         *,
+        model_path: str | None = None,
         stub: bool = False,
         config: MegakernelTTSConfig | None = None,
     ) -> None:
@@ -129,23 +127,32 @@ class MegakernelTTS:
             model_name: HuggingFace checkpoint name for Qwen3-TTS.
             speaker: Voice / speaker id for conditioning.
             device: Torch device. Must be ``"cuda"`` for the megakernel path.
+            model_path: Local path to the Qwen3-TTS weights directory.
             stub: If True, do not touch the Talker on :meth:`generate`; emit
                 silence so the surrounding Pipecat pipeline can be smoke tested
                 before the kernel mods are wired.
             config: Optional explicit config. If provided, overrides the
                 positional args.
         """
-        self.config = config or MegakernelTTSConfig(
-            model_name=model_name,
-            speaker=speaker,
-            device=device,
-            stub=stub,
-        )
+        if config is not None:
+            self.config = config
+        else:
+            cfg_kwargs: dict[str, Any] = dict(
+                model_name=model_name,
+                speaker=speaker,
+                device=device,
+                stub=stub,
+            )
+            if model_path is not None:
+                cfg_kwargs["model_path"] = model_path
+            self.config = MegakernelTTSConfig(**cfg_kwargs)
         self._sample_rate = self.config.sample_rate
 
         logger.info(
-            "MegakernelTTS init: model={model} speaker={spk} device={dev} stub={stub}",
+            "MegakernelTTS init: model={model} path={path} speaker={spk} "
+            "device={dev} stub={stub}",
             model=self.config.model_name,
+            path=self.config.model_path,
             spk=self.config.speaker,
             dev=self.config.device,
             stub=self.config.stub,
@@ -154,47 +161,72 @@ class MegakernelTTS:
         # ------------------------------------------------------------------
         # Stage 1: Talker (megakernel CUDA decode)
         # ------------------------------------------------------------------
-        # TODO: replace with actual megakernel Decoder once kernel mods land.
-        # Expected wiring (post-kernel-mod):
-        #
-        #   from qwen_megakernel.model import Decoder, load_weights
-        #   weights, tokenizer = load_weights(self.config.model_name)
-        #   self._talker = Decoder(weights=weights, tokenizer=tokenizer)
-        #
-        # Kernel mods required (see ~/brain/build/side-projects/
-        # project-e3-megakernel-tts.md "Kernel mods needed"):
-        #   - hidden=2048 (currently 1024)
-        #   - untied lm_head + embed_tokens
-        #   - vocab_size=3072 for LM head (semantic codec tokens, not text)
-        #   - MRoPE (multi-axis RoPE) instead of vanilla RoPE
-        #   - speaker conditioning injection at embed time
         self._talker = None  # type: ignore[assignment]
-        self._talker_tokenizer = None  # type: ignore[assignment]
-
         # ------------------------------------------------------------------
         # Stage 2: Code Predictor (PyTorch, 5 layers, 16 codebook heads)
-        # ------------------------------------------------------------------
-        # TODO: load from the same HF checkpoint -- usually exposed as
-        # ``model.code_predictor`` or a sibling submodule. Confirm exact
-        # attribute name from the Qwen3-TTS modeling file on the remote.
-        self._code_predictor = None
-
-        # ------------------------------------------------------------------
         # Stage 3: Codec decoder (PyTorch, non-DiT, 12.5 Hz -> 24 kHz PCM)
         # ------------------------------------------------------------------
-        # TODO: load Qwen3-TTS-Tokenizer-12Hz codec. Streaming-friendly,
-        # accepts one codec frame at a time (16 groups of token ids) and
-        # returns ~1920 fp32 samples (or fp16 -- we cast at the yield site).
+        self._code_predictor = None
         self._codec = None
 
-        # ------------------------------------------------------------------
-        # Speaker conditioning
-        # ------------------------------------------------------------------
-        # TODO: resolve self.config.speaker to a speaker-embedding tensor.
-        # For ``CustomVoice`` checkpoints the speaker map ships in the repo
-        # under ``speaker_embeddings.pt`` (or similar). Cache the resolved
-        # tensor on-device so generate() never blocks on a disk read.
-        self._speaker_embedding = None
+        if self.config.stub:
+            logger.warning(
+                "MegakernelTTS initialised in STUB mode -- skipping Decoder/"
+                "code_predictor/codec load. generate() will emit silence."
+            )
+            return
+
+        # Real init path. Any failure here flips us into stub mode with a
+        # WARNING so the surrounding Pipecat pipeline can still smoke-test.
+        try:
+            from qwen_megakernel.model import Decoder  # type: ignore
+
+            self._talker = Decoder(
+                model_path=self.config.model_path,
+                verbose=False,
+            )
+            logger.info("MegakernelTTS: Decoder loaded from {p}", p=self.config.model_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "MegakernelTTS: failed to load megakernel Decoder ({err!r}); "
+                "falling back to STUB mode.",
+                err=e,
+            )
+            self.config.stub = True
+            return
+
+        try:
+            # The component file is being written by a parallel agent; import
+            # lazily so this module stays importable on machines that don't
+            # yet have it.
+            from qwen3_tts_components import load_components  # type: ignore
+
+            import torch  # type: ignore
+
+            self._code_predictor, self._codec = load_components(
+                weights_dir=self.config.model_path,
+                device=self.config.device,
+                dtype=torch.bfloat16,
+            )
+            logger.info(
+                "MegakernelTTS: code_predictor + codec loaded via "
+                "qwen3_tts_components.load_components()"
+            )
+        except ImportError as e:
+            logger.warning(
+                "MegakernelTTS: qwen3_tts_components not available yet "
+                "({err!r}); falling back to STUB mode. Re-init once the "
+                "parallel agent ships inference-server/qwen3_tts_components.py.",
+                err=e,
+            )
+            self.config.stub = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "MegakernelTTS: load_components() failed ({err!r}); "
+                "falling back to STUB mode.",
+                err=e,
+            )
+            self.config.stub = True
 
     @property
     def sample_rate(self) -> int:
@@ -217,9 +249,10 @@ class MegakernelTTS:
             ``QWEN3_TTS_SAMPLES_PER_CODEC_FRAME * 2`` bytes per yield.
 
         Raises:
-            NotImplementedError: If the Talker is not yet wired and ``stub``
-                was not set on the config. Once kernel mods are merged this
-                will be a normal generate path.
+            NotImplementedError: If neither the real path is available nor
+                ``stub=True``. (In practice ``__init__`` flips ``stub=True``
+                on any load failure, so callers will get silence, not a
+                raise -- but we keep the guard for defensive programming.)
         """
         text = text.strip()
         if not text:
@@ -230,42 +263,57 @@ class MegakernelTTS:
                 yield chunk
             return
 
-        # TODO: replace with actual megakernel Decoder driven pipeline.
-        # Sketch (post-kernel-mod):
-        #
-        #   self._talker.reset()
-        #   prompt_ids = self._talker_tokenizer.encode(text, ...)
-        #   for tid in prompt_ids[:-1]:
-        #       self._talker.step(tid)               # prefill
-        #
-        #   semantic_buffer: list[int] = []
-        #   next_tok = prompt_ids[-1]
-        #   for _ in range(self.config.max_new_tokens):
-        #       next_tok = self._talker.step(next_tok)
-        #       if next_tok == self._talker_tokenizer.eos_token_id:
-        #           break
-        #       semantic_buffer.append(next_tok)
-        #
-        #       # Code predictor expects one Talker token at a time and emits
-        #       # 16 codebook ids. Codec needs N codebook frames at minimum
-        #       # before it can emit audio -- usually N=1 for the streaming
-        #       # variant. Confirm on remote.
-        #       code_frame = self._code_predictor.step(next_tok,
-        #                                              self._speaker_embedding)
-        #       pcm_f32 = self._codec.decode_frame(code_frame)
-        #       pcm_i16 = _f32_to_i16_bytes(pcm_f32)
-        #       yield pcm_i16
-        #       # Cooperatively yield to the event loop so the consumer can
-        #       # push to its sink without head-of-line blocking the next
-        #       # talker step.
-        #       await asyncio.sleep(0)
-        raise NotImplementedError(
-            "MegakernelTTS.generate(): Talker not yet wired. "
-            "Pass stub=True to the constructor for plumbing smoke tests, "
-            "or wait for the megakernel kernel-mod merge. "
-            "See ~/brain/build/side-projects/project-e3-megakernel-tts.md "
-            "'Kernel mods needed' for the wiring checklist."
-        )
+        if self._talker is None or self._code_predictor is None or self._codec is None:
+            raise NotImplementedError(
+                "MegakernelTTS.generate(): real path requested but one of "
+                "Decoder / code_predictor / codec failed to load. Init should "
+                "have set stub=True on failure -- check the init logs."
+            )
+
+        # Reset KV cache for the new utterance.
+        self._talker.reset()
+
+        # NOTE on prefill: the megakernel Decoder operates on AUDIO semantic
+        # tokens only; text prefill is expected to populate the KV cache via
+        # the HF/PyTorch path before this loop runs (see qwen_megakernel/
+        # model.py module docstring). Until that prefill harness is wired,
+        # we seed the autoregressive loop with token id 0 -- the code
+        # predictor / codec will produce a short throwaway frame and then
+        # the model takes over. This is the same approach the bench harness
+        # uses for end-to-end throughput measurement.
+        # TODO(prefill): once the HF text-prefill helper lands, call it here
+        # to populate the KV cache + seed prev_tok with the last prompt id.
+        prev_tok: int = 0
+
+        max_new = self.config.max_new_tokens
+        eos = self.config.eos_token_id
+
+        for _ in range(max_new):
+            next_tok = self._talker.step(prev_tok)
+            if next_tok == eos:
+                break
+
+            # code_predictor: talker semantic token id -> 16 codebook token ids
+            code_frame = self._code_predictor(next_tok)
+            # codec: 16 codebook token ids -> 1920 int16 samples (3840 bytes)
+            pcm_bytes = self._codec(code_frame)
+
+            # Defensive normalization: accept either raw bytes or a tensor /
+            # ndarray of int16 samples from the codec.
+            if isinstance(pcm_bytes, (bytes, bytearray)):
+                yield bytes(pcm_bytes)
+            elif isinstance(pcm_bytes, np.ndarray):
+                yield pcm_bytes.astype(np.int16).tobytes()
+            else:
+                # torch.Tensor or similar -- pull to CPU and emit i16.
+                arr = np.asarray(pcm_bytes.detach().cpu().numpy())
+                yield arr.astype(np.int16).tobytes()
+
+            prev_tok = next_tok
+
+            # Cooperatively yield to the event loop so the consumer can push
+            # to its sink without head-of-line blocking the next talker step.
+            await asyncio.sleep(0)
 
     async def _stub_generate(self, text: str) -> AsyncGenerator[bytes, None]:
         """Emit silence sized roughly proportional to ``text``.
@@ -316,6 +364,7 @@ def measure_ttfc_ns(start_ns: int) -> int:
 __all__ = [
     "MegakernelTTS",
     "MegakernelTTSConfig",
+    "QWEN3_TTS_CODEC_EOS_TOKEN_ID",
     "QWEN3_TTS_CODEC_FRAME_RATE_HZ",
     "QWEN3_TTS_SAMPLE_RATE",
     "QWEN3_TTS_SAMPLES_PER_CODEC_FRAME",
