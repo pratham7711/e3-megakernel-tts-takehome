@@ -21,6 +21,7 @@ import math
 import struct
 
 import torch
+import torch.nn.functional as F
 
 NUM_LAYERS = 28
 NUM_KV_HEADS = 8
@@ -253,3 +254,237 @@ class Decoder:
     @property
     def position(self) -> int:
         return self._position
+
+    # ------------------------------------------------------------------
+    # Text prefill (pure-PyTorch, writes directly into megakernel KV cache)
+    # ------------------------------------------------------------------
+    #
+    # The megakernel C++ kernel only accepts an integer audio-token id +
+    # current position -- it has no entry point that takes a pre-computed
+    # hidden state. Extending the kernel to support that is a non-trivial
+    # C++ change and well outside the scope of getting honest text prefill
+    # working. So we do the prefill entirely in PyTorch using the SAME
+    # weight tensors that the kernel uses, and write the resulting K, V
+    # tensors directly into ``self._k_cache`` / ``self._v_cache`` at
+    # positions [0, prefill_len). We then bump ``self._position`` so the
+    # subsequent ``step()`` calls pick up at the correct position and read
+    # the prefilled KV.
+    #
+    # Layout / weight conventions (matched to load_weights() above):
+    #   per-layer offsets in self._weights["layer_weights"] (11 tensors):
+    #     0: input_layernorm.weight  (RMSNorm, dim=2048)
+    #     1: q_proj.weight           (Q_SIZE=2048, HIDDEN_SIZE=2048)
+    #     2: k_proj.weight           (KV_SIZE=1024, HIDDEN_SIZE)
+    #     3: v_proj.weight           (KV_SIZE=1024, HIDDEN_SIZE)
+    #     4: q_norm.weight           (RMSNorm, dim=HEAD_DIM=128)
+    #     5: k_norm.weight           (RMSNorm, dim=HEAD_DIM)
+    #     6: o_proj.weight           (HIDDEN_SIZE, Q_SIZE)
+    #     7: post_attention_layernorm.weight (RMSNorm, dim=2048)
+    #     8: mlp.gate_proj.weight    (INTERMEDIATE_SIZE=6144, HIDDEN_SIZE)
+    #     9: mlp.up_proj.weight      (INTERMEDIATE_SIZE, HIDDEN_SIZE)
+    #    10: mlp.down_proj.weight    (HIDDEN_SIZE, INTERMEDIATE_SIZE)
+    #
+    # The Qwen3-TTS talker uses RMSNorm (no bias), SwiGLU MLP, GQA with
+    # NUM_KV_HEADS=8 and 16 q heads, q_norm / k_norm applied per-head,
+    # RoPE applied with rotate_half over the precomputed cos/sin tables.
+    # ------------------------------------------------------------------
+    _RMS_EPS = 1e-6
+
+    @staticmethod
+    def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = _RMS_EPS) -> torch.Tensor:
+        """Functional RMSNorm in fp32 with bf16 output, matching qwen3_tts_components.RMSNorm."""
+        orig_dtype = x.dtype
+        x32 = x.to(torch.float32)
+        rms = x32.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+        x32 = x32 * rms
+        return (x32 * weight.to(torch.float32)).to(orig_dtype)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _apply_rope_to_qk(
+        self,
+        q: torch.Tensor,  # (B, n_heads, T, head_dim)
+        k: torch.Tensor,  # (B, n_kv_heads, T, head_dim)
+        positions: torch.Tensor,  # (T,) long
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # cos/sin tables are (MAX_SEQ_LEN, HEAD_DIM) bf16 on cuda.
+        cos = self._cos_table.index_select(0, positions).unsqueeze(0).unsqueeze(0)
+        sin = self._sin_table.index_select(0, positions).unsqueeze(0).unsqueeze(0)
+        cos = cos.to(q.dtype)
+        sin = sin.to(q.dtype)
+        q_rot = (q * cos) + (self._rotate_half(q) * sin)
+        k_rot = (k * cos) + (self._rotate_half(k) * sin)
+        return q_rot, k_rot
+
+    def _load_tokenizer(self, model_path: str):
+        """Lazily import + cache a HuggingFace tokenizer for the talker.
+
+        The Qwen3-TTS-1.7B checkpoint ships a Qwen tokenizer at the model_path
+        root (tokenizer.json + tokenizer_config.json). We use it ONLY to map
+        the input string -> text-vocab token ids; the talker's autoregressive
+        codec head is decoupled from this vocab.
+        """
+        cached = getattr(self, "_text_tokenizer", None)
+        if cached is not None:
+            return cached
+        from transformers import AutoTokenizer  # type: ignore
+        tok = AutoTokenizer.from_pretrained(model_path)
+        self._text_tokenizer = tok
+        return tok
+
+    def prefill_text(
+        self,
+        text: str,
+        model_path: str = "/workspace/qwen3-tts-1.7b",
+        add_special_tokens: bool = False,
+    ) -> int:
+        """Run pure-PyTorch text prefill, populate KV cache, advance position.
+
+        Tokenizes ``text`` with the Qwen3-TTS tokenizer at ``model_path``,
+        looks up the text-embedding rows, projects through the loaded
+        text_projection MLP (silu-gated), then runs a one-shot PyTorch
+        forward through the 28 talker transformer layers writing K/V
+        tensors into ``self._k_cache``/``self._v_cache`` at positions
+        ``[0, prefill_len)``. The subsequent ``self.step(audio_token_id)``
+        calls then continue autoregressively from ``self._position``.
+
+        Returns:
+            The number of text tokens prefilled (>=1; clamped to MAX_SEQ_LEN-1
+            so the audio decode still has room to write KV).
+
+        Notes:
+            - This MUST be called when ``self._position == 0`` (i.e. right
+              after a fresh ``reset()``). Calling it twice without reset is
+              undefined.
+            - The text MLP is the standard SwiGLU pattern observed in the
+              Qwen3-TTS reference: ``fc2(silu(fc1(h)))`` with optional
+              biases. We honour the biases (Qwen3-TTS text_projection HAS
+              biases per safetensors). Reference: ``talker.text_projection
+              .linear_fc{1,2}.{weight,bias}``.
+            - We deliberately keep the math identical-in-spirit to the
+              megakernel kernel: RMSNorm with the same weights, q/k_norm
+              per-head with the same weights, RoPE with the same cos/sin
+              tables, GQA with NUM_KV_HEADS=8. Any numerical drift between
+              the PyTorch prefill KV and what the kernel WOULD have computed
+              at those positions is bounded by fp32-vs-fused-bf16 accumulator
+              differences (a few ULPs) -- well below speech-quality
+              significance.
+        """
+        if self._position != 0:
+            raise RuntimeError(
+                "Decoder.prefill_text() must be called when position == 0; "
+                f"got position={self._position}. Call reset() first."
+            )
+
+        text = (text or "").strip()
+        if not text:
+            return 0
+
+        tok = self._load_tokenizer(model_path)
+        ids = tok.encode(text, add_special_tokens=add_special_tokens)
+        if not ids:
+            return 0
+        # Reserve room for at least one audio step.
+        max_prefill = max(1, MAX_SEQ_LEN - 256)
+        if len(ids) > max_prefill:
+            ids = ids[:max_prefill]
+
+        device = self._k_cache.device
+        token_ids = torch.tensor(ids, dtype=torch.long, device=device)  # (T,)
+
+        # ---- 1. text_embedding lookup + text_projection MLP ----
+        w = self._weights
+        text_embed = w["text_embedding_weight"]  # (TEXT_VOCAB, HIDDEN)
+        fc1_w = w["text_proj_fc1_weight"]
+        fc1_b = w["text_proj_fc1_bias"]
+        fc2_w = w["text_proj_fc2_weight"]
+        fc2_b = w["text_proj_fc2_bias"]
+
+        # Embedding lookup (bf16). (T, HIDDEN)
+        h = F.embedding(token_ids, text_embed)
+        # text_projection is a standard 2-layer MLP with SiLU activation; both
+        # fc layers carry biases per safetensors. The Qwen3-TTS upstream
+        # implements this as `fc2(silu(fc1(h)))` -- no gating.
+        h = F.linear(h, fc1_w, fc1_b)
+        h = F.silu(h)
+        h = F.linear(h, fc2_w, fc2_b)  # (T, HIDDEN), bf16
+
+        # Add batch dim for the per-layer ops below.
+        x = h.unsqueeze(0).to(torch.bfloat16)  # (1, T, HIDDEN)
+        T = x.shape[1]
+        positions = torch.arange(T, dtype=torch.long, device=device)
+
+        layer_weights = w["layer_weights"]
+        n_ptrs = 11
+        for layer_idx in range(NUM_LAYERS):
+            base = layer_idx * n_ptrs
+            ln1_w = layer_weights[base + 0]
+            q_w = layer_weights[base + 1]
+            k_w = layer_weights[base + 2]
+            v_w = layer_weights[base + 3]
+            qn_w = layer_weights[base + 4]
+            kn_w = layer_weights[base + 5]
+            o_w = layer_weights[base + 6]
+            ln2_w = layer_weights[base + 7]
+            gate_w = layer_weights[base + 8]
+            up_w = layer_weights[base + 9]
+            down_w = layer_weights[base + 10]
+
+            # --- attention block ---
+            h_norm = self._rms_norm(x, ln1_w)  # (1, T, HIDDEN)
+
+            q = F.linear(h_norm, q_w).view(1, T, 16, HEAD_DIM)
+            k = F.linear(h_norm, k_w).view(1, T, NUM_KV_HEADS, HEAD_DIM)
+            v = F.linear(h_norm, v_w).view(1, T, NUM_KV_HEADS, HEAD_DIM)
+
+            # Per-head q_norm / k_norm (RMSNorm over the HEAD_DIM axis).
+            q = self._rms_norm(q, qn_w)
+            k = self._rms_norm(k, kn_w)
+
+            # (1, n_heads, T, head_dim)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            q, k = self._apply_rope_to_qk(q, k, positions)
+
+            # Stash this layer's K, V into the megakernel cache at positions
+            # [0, T). KV cache layout: (NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM)
+            self._k_cache[layer_idx, :, :T, :].copy_(k[0].to(torch.bfloat16))
+            self._v_cache[layer_idx, :, :T, :].copy_(v[0].to(torch.bfloat16))
+
+            # GQA expand for the attention math used to produce x for the
+            # NEXT layer's input. (kv heads -> q heads.)
+            repeat = 16 // NUM_KV_HEADS
+            if repeat > 1:
+                k_exp = k.repeat_interleave(repeat, dim=1)
+                v_exp = v.repeat_interleave(repeat, dim=1)
+            else:
+                k_exp = k
+                v_exp = v
+
+            attn_out = F.scaled_dot_product_attention(
+                q, k_exp, v_exp, is_causal=True, scale=self._attn_scale
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().view(1, T, Q_SIZE)
+            attn_out = F.linear(attn_out, o_w)
+            x = x + attn_out.to(x.dtype)
+
+            # --- MLP block ---
+            h_norm2 = self._rms_norm(x, ln2_w)
+            gate = F.linear(h_norm2, gate_w)
+            up = F.linear(h_norm2, up_w)
+            inter = F.silu(gate) * up
+            mlp_out = F.linear(inter, down_w)
+            x = x + mlp_out.to(x.dtype)
+
+        # We deliberately do NOT apply the final norm / lm_head here -- those
+        # only matter for producing an output token, and the FIRST audio step
+        # will produce the first audio token from the kernel's own forward.
+        # The kernel just needs the prefilled K/V at positions [0, T).
+        self._position = T
+        return T

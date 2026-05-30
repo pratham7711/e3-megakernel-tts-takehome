@@ -166,8 +166,13 @@ def bench_decode_tok_per_s(
         n=n_tokens,
     )
 
-    decoder = Decoder(model_name=model_name, verbose=False)
-    seed_token = decoder.tokenizer.encode("Hello", add_special_tokens=False)[0]
+    # H2 fix: Decoder takes model_path (not model_name), and doesn't expose
+    # a .tokenizer attribute (the new model.py loads weights via safetensors
+    # and skips the HF tokenizer entirely). For the talker-only bench we just
+    # seed with token id 0 — output is unconditioned (the brief's tok/s
+    # metric is about decode throughput, not acoustic quality).
+    decoder = Decoder(model_path=model_name, verbose=False)
+    seed_token = 0
 
     def _one_pass() -> float:
         decoder.reset()

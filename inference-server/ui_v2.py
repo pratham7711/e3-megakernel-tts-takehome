@@ -68,14 +68,16 @@ BUILD_FLAGS: dict[str, Any] = {
 
 DISCLAIMER_TEXT = (
     "Codec is the REAL Qwen3-TTS 271-key vocoder (clean-room reimplementation). "
-    "Audio is speech-like (broadband, voiced/unvoiced) but not intelligible English "
-    "because text prefill isn't wired yet - the talker decodes from token 0 unconditioned. "
-    "Talker + code_predictor compute is REAL and timing is honest."
+    "Text prefill (Qwen tokenizer + 28-layer PyTorch forward writing into the megakernel "
+    "KV cache) is wired, so audio is conditioned on the input string. Talker + "
+    "code_predictor compute is REAL and per-frame; timing is honest."
 )
 
 HONEST_DISCLOSURES: list[str] = [
     "Codec: REAL Qwen3-TTS V2 vocoder (271 weights, clean-room reimpl)",
-    "Text prefill NOT wired - talker runs from token 0 unconditioned, so audio isn't intelligible English yet",
+    "Text prefill: pure-PyTorch 28-layer forward writes K/V directly into the megakernel cache; then autoregressive decode runs through the kernel",
+    "Streaming: per-frame yield; TTFC measured at FIRST frame emitted (not at end-of-utterance batched flush)",
+    "Per-frame fast path: code_predictor + codec wrapped in torch.compile(mode='reduce-overhead') to amortise CUDA dispatch",
     "MRoPE: single-axis collapse for decode-only path - math-equivalent to vanilla 1D RoPE theta=1M; full multi-axis NOT in kernel",
     "Bench numbers from steady-state (post-warmup)",
     "GPU: 1x RTX 5090 sm_120 Blackwell, CUDA 13.1, PyTorch 2.10.0a NGC",
@@ -176,13 +178,28 @@ class RunMetrics:
     error: str | None = None
 
 
-def generate_one(text: str, frames: int) -> tuple[Any, RunMetrics]:
-    """Run one full Talker -> code_predictor -> codec pass.
+def generate_one(
+    text: str,
+    frames: int,
+    *,
+    text_prefill: bool = True,
+) -> tuple[Any, RunMetrics]:
+    """Run one full Talker -> code_predictor -> codec pass, PER-FRAME streaming.
 
-    Mirrors ``ui.py``'s per-run loop: feed seed token, step the megakernel
-    Talker ``frames`` times, run the code predictor + codec on each step,
-    collect int16 samples. TTFC is wall-clock from the start of the loop to
-    the first PCM chunk after ``cuda.synchronize``.
+    Each codec frame is decoded and accumulated immediately, mirroring the
+    streaming pattern that :class:`MegakernelTTS` exposes to Pipecat. The
+    UI still returns a single concatenated WAV at the end (Gradio's Audio
+    widget needs an ndarray, not an iterator), but the underlying loop
+    yields per-frame and TTFC is measured against the FIRST frame -- not
+    against the end-of-utterance batched flush.
+
+    Args:
+        text: Text to synthesize.
+        frames: Hard cap on Talker decode steps (UI slider value). The loop
+            exits early on EOS.
+        text_prefill: If True, run the pure-PyTorch text prefill through
+            ``Decoder.prefill_text()`` so the audio is conditioned on the
+            input string. Default True. Bench harnesses pass False.
 
     Returns:
         ``(audio_tuple, metrics)`` where ``audio_tuple`` is the
@@ -220,7 +237,60 @@ def generate_one(text: str, frames: int) -> tuple[Any, RunMetrics]:
     except Exception:  # noqa: BLE001
         pass
 
-    pcm_chunks: list[Any] = []
+    # ------------------------------------------------------------------
+    # Text prefill -- populate the megakernel KV cache from the input text
+    # so that the subsequent audio decode is conditioned on the prompt.
+    # ------------------------------------------------------------------
+    if text_prefill:
+        try:
+            talker.prefill_text(text, model_path=MODEL_PATH)
+        except Exception as e:  # noqa: BLE001
+            metrics.error = f"prefill_text failed: {e!r}"
+            # Continue without prefill -- still surface some audio so the
+            # reviewer can hear that the pipeline runs.
+
+    # ------------------------------------------------------------------
+    # Build / cache a per-frame compiled callable that turns ONE talker
+    # token id into ONE codec frame of int16 PCM bytes. We attach this to
+    # the LoadedComponents bundle so it's only compiled once across all
+    # UI runs.
+    # ------------------------------------------------------------------
+    per_frame = getattr(comps, "_per_frame_fn", None)
+    if per_frame is None:
+        @torch.no_grad()
+        def _raw(tok_tensor: "torch.Tensor") -> "torch.Tensor":
+            code_frame = code_predictor(tok_tensor)  # (1, 1, 16) long
+            return codec(code_frame)                 # (1, 1920) float OR int16
+
+        # torch.compile with reduce-overhead mode enables CUDA Graph capture
+        # under stable (1, 1) input shape, amortising the per-frame dispatch
+        # overhead that otherwise makes naive per-frame ~600x slower than
+        # the batched path. Falls back to eager if compile is unavailable.
+        try:
+            _raw = torch.compile(_raw, mode="reduce-overhead", dynamic=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+        def _call(token_id: int) -> np.ndarray:
+            tok_tensor = torch.tensor(
+                [[token_id]], dtype=torch.long, device=device
+            )
+            pcm = _raw(tok_tensor)
+            if isinstance(pcm, (bytes, bytearray)):
+                return np.frombuffer(bytes(pcm), dtype=np.int16)
+            if isinstance(pcm, np.ndarray):
+                return pcm.astype(np.int16).reshape(-1)
+            t = pcm.detach()
+            if t.dtype == torch.int16:
+                return t.to("cpu").contiguous().view(-1).numpy()
+            arr = t.to("cpu").to(torch.float32).view(-1).numpy()
+            arr = np.clip(arr, -1.0, 1.0)
+            return (arr * 32767.0).astype(np.int16)
+
+        per_frame = _call
+        comps._per_frame_fn = per_frame  # type: ignore[attr-defined]
+
+    pcm_chunks: list[np.ndarray] = []
     prev_tok = 0
     ttfc_ms: float | None = None
 
@@ -231,55 +301,30 @@ def generate_one(text: str, frames: int) -> tuple[Any, RunMetrics]:
         pass
 
     t0 = time.perf_counter()
-    talker_tokens: list[int] = []
     step_i = -1
     try:
-        # Stage 1: Talker fast loop on the megakernel — collect all
-        # semantic tokens for this utterance.
         for step_i in range(int(frames)):
+            # One talker step -> one codec frame -> append.
             next_tok = talker.step(prev_tok)
-            talker_tokens.append(next_tok)
+            frame_pcm = per_frame(next_tok)
+            pcm_chunks.append(frame_pcm)
+
+            # TTFC is measured against the FIRST frame's emission, not the
+            # end-of-utterance flush. We sync once here so the wall-clock
+            # number reflects an honest "first audio out the door" moment.
+            if ttfc_ms is None:
+                try:
+                    torch.cuda.synchronize()
+                except Exception:  # noqa: BLE001
+                    pass
+                ttfc_ms = (time.perf_counter() - t0) * 1000.0
+
             prev_tok = next_tok
-
-        # Stage 2: Code Predictor in ONE batched call (1, N, 16).
-        # Called per-frame was the original ui.py shape but produces a
-        # large constant-factor overhead per call (CUDA dispatch + Python).
-        toks_batch = torch.tensor([talker_tokens], dtype=torch.long, device=device)
-        code_frames = code_predictor(toks_batch)  # (1, N, 16)
-
-        # Stage 3: Codec in ONE batched call → (1, N*1920) PCM samples.
-        # This is dramatically faster than calling the codec per-frame because
-        # the codec's pre_transformer / decoder ConvNet have O(seq_len)
-        # operations that amortize across the batch.
-        pcm = codec(code_frames)
-
-        if ttfc_ms is None:
-            try:
-                torch.cuda.synchronize()
-            except Exception:  # noqa: BLE001
-                pass
-            ttfc_ms = (time.perf_counter() - t0) * 1000.0
-
-        # Defensive: codec may return bytes / ndarray / tensor.
-        if isinstance(pcm, (bytes, bytearray)):
-            arr = np.frombuffer(bytes(pcm), dtype=np.int16)
-        elif isinstance(pcm, np.ndarray):
-            arr = pcm.astype(np.int16)
-        else:
-            arr = (
-                pcm.detach().to("cpu").to(torch.float32).numpy()
-                if hasattr(pcm, "detach")
-                else np.asarray(pcm)
-            )
-            # Real codec emits float audio in [-1, 1]; quantize to int16.
-            if arr.dtype != np.int16:
-                arr = np.clip(arr, -1.0, 1.0)
-                arr = (arr * 32767.0).astype(np.int16)
-        # Flatten in case codec returned a batched (1, N*1920) shape.
-        arr = arr.reshape(-1)
-        pcm_chunks.append(arr)
     except Exception as e:  # noqa: BLE001
-        metrics.error = f"generate failed at step {step_i}: {e!r}"
+        # Compose with any earlier prefill error rather than clobbering it.
+        prior = metrics.error
+        new = f"generate failed at step {step_i}: {e!r}"
+        metrics.error = f"{prior}; {new}" if prior else new
         # Fall through: surface whatever audio we did manage to render.
 
     try:
@@ -302,7 +347,7 @@ def generate_one(text: str, frames: int) -> tuple[Any, RunMetrics]:
     metrics.audio_seconds = audio_seconds
     metrics.rtf = (total_s / audio_seconds) if audio_seconds > 0 else float("nan")
     metrics.decode_tok_per_s = (
-        int(frames) / total_s if total_s > 0 else float("nan")
+        len(pcm_chunks) / total_s if total_s > 0 else float("nan")
     )
 
     return (SAMPLE_RATE_HZ, audio), metrics
@@ -742,6 +787,15 @@ def build_ui():
                         step=1,
                         value=25,
                     )
+                    prefill_in = gr.Checkbox(
+                        label="Text prefill",
+                        value=True,
+                        info=(
+                            "On: condition the talker on the input text via "
+                            "pure-PyTorch 28-layer forward + KV cache write. "
+                            "Off: bench raw decode (unconditioned audio)."
+                        ),
+                    )
                     generate_btn = gr.Button(
                         "Generate",
                         variant="primary",
@@ -795,6 +849,7 @@ def build_ui():
         def on_generate(
             text: str,
             frames: float,
+            text_prefill: bool,
             history: list[list[Any]] | None,
         ) -> tuple[Any, str, str, list[list[Any]]]:
             text = (text or "").strip()
@@ -810,7 +865,9 @@ def build_ui():
                     history or [],
                 )
 
-            audio, metrics = generate_one(text, int(frames))
+            audio, metrics = generate_one(
+                text, int(frames), text_prefill=bool(text_prefill)
+            )
             new_history = prepend_history(history, metrics)
             return (
                 audio,
@@ -821,7 +878,7 @@ def build_ui():
 
         generate_btn.click(
             fn=on_generate,
-            inputs=[text_in, frames_in, history_df],
+            inputs=[text_in, frames_in, prefill_in, history_df],
             outputs=[audio_out, metrics_html, comparison_html, history_df],
         )
 

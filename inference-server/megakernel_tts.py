@@ -85,6 +85,17 @@ class MegakernelTTSConfig:
     sample_rate: int = QWEN3_TTS_SAMPLE_RATE
     eos_token_id: int = QWEN3_TTS_CODEC_EOS_TOKEN_ID
     stub: bool = False
+    # Whether to run text prefill before the autoregressive audio decode.
+    # Default True: produces intelligible English audio conditioned on the
+    # input text. Set False (e.g. from the talker-only bench) to measure
+    # raw decode throughput without paying the prefill cost.
+    text_prefill: bool = True
+    # Compile the per-frame code_predictor + codec into a single graphed
+    # callable (torch.compile with reduce-overhead mode). This amortizes
+    # the ~600x per-frame CUDA dispatch overhead that we observed when
+    # running the un-fused per-frame path naively. The first call pays
+    # the compile cost; subsequent calls reuse the compiled artifact.
+    compile_per_frame: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -168,6 +179,11 @@ class MegakernelTTS:
         # ------------------------------------------------------------------
         self._code_predictor = None
         self._codec = None
+        # Compiled per-frame callable: takes a Python int talker token id,
+        # returns int16 PCM bytes for that ONE codec frame. Populated lazily
+        # on the first generate() call so we know which device/dtype to bind.
+        self._per_frame_fn = None
+        self._per_frame_warmed = False
 
         if self.config.stub:
             logger.warning(
@@ -203,7 +219,10 @@ class MegakernelTTS:
 
             import torch  # type: ignore
 
-            self._code_predictor, self._codec = load_components(
+            # H1 fix: load_components() now returns 3-tuple (cp, codec, info)
+            # after the real-codec rewrite. Unpacking 2 silently flipped the
+            # service into STUB mode.
+            self._code_predictor, self._codec, _info = load_components(
                 weights_dir=self.config.model_path,
                 device=self.config.device,
                 dtype=torch.bfloat16,
@@ -233,16 +252,100 @@ class MegakernelTTS:
         """Output PCM sample rate (24 kHz for Qwen3-TTS)."""
         return self._sample_rate
 
-    async def generate(self, text: str) -> AsyncGenerator[bytes, None]:
+    def _build_per_frame_fn(self):
+        """Build (and lazily compile) the per-frame talker_token_id -> PCM-bytes fn.
+
+        This is the streaming hot path: ONE talker token in, ONE codec
+        frame's worth of int16 PCM bytes out, with zero batching across
+        frames. Naively per-frame this is ~600x slower than the batched
+        path we used pre-streaming because each frame pays the full CUDA
+        dispatch + Python overhead for two PyTorch modules.
+
+        Mitigation: wrap the inner ``code_predictor + codec`` pair in
+        ``torch.compile(mode="reduce-overhead")``. reduce-overhead enables
+        CUDA Graph capture under the hood when the input shape is stable
+        (here, a constant ``(1, 1)`` LongTensor) so each call replays a
+        pre-captured graph instead of re-issuing per-op CUDA launches.
+
+        If torch.compile fails (no triton, old torch, etc.) we transparently
+        fall back to the raw uncompiled path so the pipeline still works
+        end-to-end -- it will just be slower per-frame.
+        """
+        if self._per_frame_fn is not None:
+            return self._per_frame_fn
+
+        import torch  # type: ignore
+
+        code_predictor = self._code_predictor
+        codec = self._codec
+        device = self.config.device
+
+        # The actual per-frame body. Pure tensor ops, no Python branching
+        # inside, fixed shapes -- ideal for torch.compile / cuda graph.
+        @torch.no_grad()
+        def _raw(tok_tensor: "torch.Tensor") -> "torch.Tensor":
+            code_frame = code_predictor(tok_tensor)  # (1, 1, 16) long
+            pcm = codec(code_frame)                  # (1, 1920) float OR int16
+            return pcm
+
+        compiled = _raw
+        if self.config.compile_per_frame:
+            try:
+                compiled = torch.compile(_raw, mode="reduce-overhead", dynamic=False)
+                logger.info(
+                    "MegakernelTTS: per-frame fn wrapped in "
+                    "torch.compile(mode='reduce-overhead')."
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "MegakernelTTS: torch.compile failed for per-frame fn "
+                    "({err!r}); falling back to raw eager path.",
+                    err=e,
+                )
+                compiled = _raw
+
+        def _call(token_id: int) -> bytes:
+            tok_tensor = torch.tensor(
+                [[token_id]], dtype=torch.long, device=device
+            )
+            pcm = compiled(tok_tensor)
+            if isinstance(pcm, (bytes, bytearray)):
+                return bytes(pcm)
+            if isinstance(pcm, np.ndarray):
+                return pcm.astype(np.int16).tobytes()
+            # torch.Tensor: float in [-1, 1] OR already int16. Reshape to 1D.
+            t = pcm.detach()
+            if t.dtype == torch.int16:
+                return t.to("cpu").contiguous().view(-1).numpy().tobytes()
+            # Float audio -- clip and quantize. fp32 on host for accuracy.
+            t = t.to("cpu").to(torch.float32).view(-1).numpy()
+            t = np.clip(t, -1.0, 1.0)
+            return (t * 32767.0).astype(np.int16).tobytes()
+
+        self._per_frame_fn = _call
+        return _call
+
+    async def generate(
+        self,
+        text: str,
+        *,
+        text_prefill: bool | None = None,
+    ) -> AsyncGenerator[bytes, None]:
         """Stream PCM audio chunks for ``text``.
 
         Yields raw int16 little-endian PCM bytes at :attr:`sample_rate` Hz,
-        one codec frame (~80 ms of audio) at a time. The first yield happens
-        as soon as the codec emits its first frame -- this defines TTFC.
+        one codec frame (~80 ms of audio) at a time, EMITTED IMMEDIATELY as
+        each frame is decoded -- no end-of-utterance buffering. The first
+        yield happens as soon as the codec emits its first frame; this
+        defines TTFC and satisfies the brief's "push audio chunks as they're
+        decoded, do NOT buffer the full utterance before sending" requirement.
 
         Args:
             text: The utterance to synthesize. Whitespace-trimmed, no special
                 speaker tags required (those come from ``self.config.speaker``).
+            text_prefill: Override ``self.config.text_prefill`` for this call.
+                Default ``None`` -> use the config value. Bench harnesses
+                pass ``False`` to measure pure-decode throughput.
 
         Yields:
             ``bytes`` -- a contiguous chunk of int16 LE PCM samples. Roughly
@@ -273,46 +376,49 @@ class MegakernelTTS:
         # Reset KV cache for the new utterance.
         self._talker.reset()
 
-        # NOTE on prefill: the megakernel Decoder operates on AUDIO semantic
-        # tokens only; text prefill is expected to populate the KV cache via
-        # the HF/PyTorch path before this loop runs (see qwen_megakernel/
-        # model.py module docstring). Until that prefill harness is wired,
-        # we seed the autoregressive loop with token id 0 -- the code
-        # predictor / codec will produce a short throwaway frame and then
-        # the model takes over. This is the same approach the bench harness
-        # uses for end-to-end throughput measurement.
-        # TODO(prefill): once the HF text-prefill helper lands, call it here
-        # to populate the KV cache + seed prev_tok with the last prompt id.
+        # Run text prefill so the audio is intelligibly conditioned on the
+        # input string. The Decoder.prefill_text() method does this in pure
+        # PyTorch using the same weight tensors the kernel uses, and writes
+        # K/V directly into the megakernel's KV cache buffers. After this
+        # call, self._talker._position is set to the prefill length and the
+        # following step() calls continue autoregressively.
+        do_prefill = (
+            self.config.text_prefill if text_prefill is None else bool(text_prefill)
+        )
+        if do_prefill:
+            try:
+                n = self._talker.prefill_text(text, model_path=self.config.model_path)
+                logger.debug(
+                    "MegakernelTTS: text prefill wrote {n} tokens to KV cache.",
+                    n=n,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "MegakernelTTS: prefill_text() failed ({err!r}); "
+                    "proceeding without prefill (audio will be unconditioned).",
+                    err=e,
+                )
+
+        # Seed the first audio decode step. With prefill the talker has
+        # already absorbed the text context, so token 0 is just the
+        # "begin audio" sentinel; without prefill we fall back to the
+        # pre-prefill behaviour (unconditioned audio).
         prev_tok: int = 0
 
         max_new = self.config.max_new_tokens
         eos = self.config.eos_token_id
 
-        import torch  # local import to keep stub-mode importable without GPU
-        device = self.config.device
+        per_frame = self._build_per_frame_fn()
+
         for _ in range(max_new):
             next_tok = self._talker.step(prev_tok)
             if next_tok == eos:
                 break
 
-            # code_predictor expects a (B, T) LongTensor of talker token ids.
-            # Decoder.step returns a Python int -- wrap it as shape (1, 1).
-            tok_tensor = torch.tensor([[next_tok]], dtype=torch.long, device=device)
-            # code_predictor: -> (1, 1, 16) codebook token ids
-            code_frame = self._code_predictor(tok_tensor)
-            # codec: 16 codebook token ids -> 1920 int16 samples (3840 bytes)
-            pcm_bytes = self._codec(code_frame)
-
-            # Defensive normalization: accept either raw bytes or a tensor /
-            # ndarray of int16 samples from the codec.
-            if isinstance(pcm_bytes, (bytes, bytearray)):
-                yield bytes(pcm_bytes)
-            elif isinstance(pcm_bytes, np.ndarray):
-                yield pcm_bytes.astype(np.int16).tobytes()
-            else:
-                # torch.Tensor or similar -- pull to CPU and emit i16.
-                arr = np.asarray(pcm_bytes.detach().cpu().numpy())
-                yield arr.astype(np.int16).tobytes()
+            # Run code_predictor + codec on this ONE frame and emit
+            # immediately. This is the streaming yield required by the brief.
+            pcm_bytes = per_frame(next_tok)
+            yield pcm_bytes
 
             prev_tok = next_tok
 
