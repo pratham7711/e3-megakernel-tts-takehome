@@ -96,7 +96,9 @@ class MegakernelTTSConfig:
     # the ~600x per-frame CUDA dispatch overhead that we observed when
     # running the un-fused per-frame path naively. The first call pays
     # the compile cost; subsequent calls reuse the compiled artifact.
-    compile_per_frame: bool = True
+    compile_per_frame: bool = field(
+        default_factory=lambda: os.environ.get("MEGAKERNEL_COMPILE_PER_FRAME", "1") == "1"
+    )
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -280,7 +282,18 @@ class MegakernelTTS:
                 )
                 compiled = _raw
 
+        # When the compiled path uses reduce-overhead (CUDA graphs), PyTorch
+        # reuses output storage across calls — meaning the previous call's
+        # output gets overwritten when the next call runs. We have to mark
+        # a "step begin" between invocations so the framework treats each
+        # frame as a separate iteration. No-op when torch.compile fell back.
+        _cudagraph_mark = getattr(
+            getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None
+        )
+
         def _call(token_id: int) -> bytes:
+            if _cudagraph_mark is not None and self.config.compile_per_frame:
+                _cudagraph_mark()
             tok_tensor = torch.tensor(
                 [[token_id]], dtype=torch.long, device=device
             )

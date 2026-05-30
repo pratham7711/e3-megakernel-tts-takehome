@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import sys
 import time
@@ -216,6 +217,9 @@ async def bench_ttfc_one_pass(tts: MegakernelTTS, text: str) -> float:
       hop, which is itself a CUDA sync point. So when the chunk reaches us,
       all GPU work for that frame is already retired. We add an explicit
       sync defensively in case a future refactor avoids the .cpu() copy.
+    - Instead of draining the generator (slow in eager mode; hangs to
+      max_new_tokens when EOS never fires), we ``aclose()`` it and call
+      ``_talker.reset()`` so the KV cache is clean for the next iteration.
     """
     import torch  # type: ignore  # local import keeps non-CUDA imports clean
     torch.cuda.synchronize()
@@ -224,11 +228,9 @@ async def bench_ttfc_one_pass(tts: MegakernelTTS, text: str) -> float:
     async for _chunk in gen:
         torch.cuda.synchronize()  # defensive — bytes arrival already implies sync
         elapsed_ns = time.perf_counter_ns() - t0_ns
-        # Drain the rest of the generator so KV cache state is consistent
-        # for the next run -- otherwise we measure prefill of a half-finished
-        # utterance.
-        async for _ in gen:
-            pass
+        await gen.aclose()
+        if hasattr(tts, "_talker") and tts._talker is not None:
+            tts._talker.reset()
         return elapsed_ns / 1_000_000.0
     return float("nan")  # generator produced nothing
 
@@ -258,7 +260,7 @@ async def bench_ttfc(
 
 
 async def bench_rtf_one_pass(
-    tts: MegakernelTTS, text: str
+    tts: MegakernelTTS, text: str, max_frames: int = 64
 ) -> tuple[float, float, float]:
     """Run one full synthesis pass, returning (rtf, wall_ms, audio_ms).
 
@@ -266,15 +268,27 @@ async def bench_rtf_one_pass(
     - Explicit ``cuda.synchronize()`` before timer start and after the last
       chunk so wall time is end-to-end GPU work, no async tails leaking in
       or out.
+    - Hard ``max_frames`` cap (default 64 ≈ 5 s of audio at 12.5 Hz codec)
+      so the bench terminates when the talker would otherwise run to
+      ``max_new_tokens`` without emitting EOS (uncompiled path + cold
+      conditioning). Aligns with the brief's "5-second target sentence".
     """
     import torch  # type: ignore
     torch.cuda.synchronize()
     total_bytes = 0
+    frames = 0
     t0 = time.perf_counter()
-    async for chunk in tts.generate(text):
+    gen = tts.generate(text)
+    async for chunk in gen:
         total_bytes += len(chunk)
+        frames += 1
+        if frames >= max_frames:
+            await gen.aclose()
+            break
     torch.cuda.synchronize()
     wall_s = time.perf_counter() - t0
+    if hasattr(tts, "_talker") and tts._talker is not None:
+        tts._talker.reset()
 
     n_samples = total_bytes // 2  # int16 = 2 bytes / sample
     audio_s = n_samples / tts.sample_rate if n_samples > 0 else float("nan")
@@ -364,12 +378,18 @@ async def main_async(args: argparse.Namespace) -> int:
     )
 
     # --- TTS pipeline (TTFC + RTF) -----------------------------------------
+    # MEGAKERNEL_COMPILE_PER_FRAME=0 disables torch.compile on the per-frame
+    # codec callable. The compiled path hits a CUDA-graph storage-reuse bug
+    # when the codec rebuilds its RoPE cos/sin table each frame; the eager
+    # path is slower (~14 ms vs ~5 ms expected) but produces honest numbers.
+    compile_per_frame = os.environ.get("MEGAKERNEL_COMPILE_PER_FRAME", "1") == "1"
     tts = MegakernelTTS(
         config=MegakernelTTSConfig(
             model_name=args.model,
             speaker=args.speaker,
             device=args.device,
             stub=args.stub,
+            compile_per_frame=compile_per_frame,
         )
     )
 

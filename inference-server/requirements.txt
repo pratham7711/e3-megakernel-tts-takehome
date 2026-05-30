@@ -30,7 +30,7 @@ torch>=2.3,<2.11
 # validated weight loading against -- earlier 4.57 releases miss the
 # Qwen3-TTS config classes.
 transformers==4.57.3
-tokenizers>=0.20,<0.22  # transformers 4.57.x compatible range
+tokenizers>=0.22,<0.24  # transformers 4.57.3 actually requires >=0.22 (the earlier <0.22 pin was wrong)
 
 # safetensors weight loader (Decoder + codec component loader).
 safetensors==0.4.5

@@ -97,7 +97,7 @@ CODEC_OUTPUT_SAMPLE_RATE = 24_000
 CODEC_FRAME_UPSAMPLE = 1920  # samples per frame (24 kHz / 12.5 Hz)
 CODEC_NUM_QUANTIZERS = 16
 CODEC_CODEBOOK_SIZE = 2048           # acoustic codebooks (rvq_rest)
-CODEC_SEMANTIC_CODEBOOK_SIZE = 4096  # semantic codebook (rvq_first) per upstream config
+CODEC_SEMANTIC_CODEBOOK_SIZE = 2048  # semantic codebook (rvq_first) — actual checkpoint shape (verified 2026-05-30 against fresh HF download of Qwen3-TTS-12Hz-1.7B-CustomVoice/speech_tokenizer/model.safetensors). Earlier "4096 fix" was based on a misread of upstream config.
 
 
 # ===========================================================================

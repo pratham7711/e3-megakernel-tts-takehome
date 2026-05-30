@@ -1,0 +1,37 @@
+{
+  "model_name": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+  "speaker": "ryan",
+  "device": "cuda",
+  "stub": false,
+  "sample_rate": 24000,
+  "decode_tok_per_s": {
+    "samples": [
+      428.48153803987714,
+      428.6470976590856,
+      428.2562368830833,
+      428.3909890553817,
+      428.341628200439
+    ],
+    "mean": 428.4234979675733,
+    "stdev": 0.13349249459404272,
+    "min": 428.2562368830833,
+    "max": 428.6470976590856
+  },
+  "ttfc_ms": {
+    "samples": [],
+    "mean": 0.0,
+    "stdev": 0.0,
+    "min": 0.0,
+    "max": 0.0
+  },
+  "rtf": {
+    "samples": [],
+    "mean": 0.0,
+    "stdev": 0.0,
+    "min": 0.0,
+    "max": 0.0
+  },
+  "audio_duration_ms_per_run": [],
+  "decode_wall_ms_per_run": [],
+  "notes": []
+}

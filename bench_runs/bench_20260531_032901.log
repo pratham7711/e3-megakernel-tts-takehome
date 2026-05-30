@@ -1,0 +1,24 @@
+2026-05-30 21:58:00.245 | INFO     | megakernel_tts:__init__:163 - MegakernelTTS init: model=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice path=/workspace/qwen3-tts-1.7b speaker=ryan device=cuda stub=False
+2026-05-30 21:58:03.044 | INFO     | megakernel_tts:__init__:208 - MegakernelTTS: Decoder loaded from /workspace/qwen3-tts-1.7b
+2026-05-30 21:58:05.623 | INFO     | megakernel_tts:__init__:221 - MegakernelTTS: code_predictor + codec loaded via qwen3_tts_components.load_components()
+2026-05-30 21:58:05.623 | INFO     | __main__:bench_decode_tok_per_s:162 - Decode tok/s bench: model=/workspace/qwen3-tts-1.7b warmup=3 timed=5 tokens=100
+2026-05-30 21:58:07.137 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 0: 0.233s -> 428.5 tok/s
+2026-05-30 21:58:07.371 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 1: 0.233s -> 428.6 tok/s
+2026-05-30 21:58:07.605 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 2: 0.234s -> 428.3 tok/s
+2026-05-30 21:58:07.839 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 3: 0.233s -> 428.4 tok/s
+2026-05-30 21:58:08.073 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 4: 0.233s -> 428.3 tok/s
+2026-05-30 21:58:08.074 | INFO     | __main__:main_async:416 - Wrote bench_results.json
+================================================================
+ Megakernel Qwen3-TTS bench results
+================================================================
+ model         : Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+ speaker       : ryan
+ device        : cuda
+ sample rate   : 24000 Hz
+ stub          : False
+
+ Decode tok/s       : 428.4 +/- 0.1 tok/s  (min=428.3, max=428.6, n=5)
+ TTFC               : -- (not measured)
+ RTF                : -- (not measured)
+
+================================================================

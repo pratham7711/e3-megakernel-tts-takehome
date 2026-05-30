@@ -1,74 +1,47 @@
 {
-  "n_runs": 5,
-  "steps_per_run": 25,
+  "model_name": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+  "speaker": "ryan",
+  "device": "cuda",
+  "stub": false,
   "sample_rate": 24000,
-  "runs": [
-    {
-      "ttfc_ms": 17.222243,
-      "total_ms": 418.460188,
-      "samples": 48000,
-      "audio_sec": 2.0,
-      "rtf": 0.209230094,
-      "toks_per_sec": 59.742839861267754
-    },
-    {
-      "ttfc_ms": 17.180436,
-      "total_ms": 418.360922,
-      "samples": 48000,
-      "audio_sec": 2.0,
-      "rtf": 0.209180461,
-      "toks_per_sec": 59.757015259661365
-    },
-    {
-      "ttfc_ms": 17.160951,
-      "total_ms": 418.354702,
-      "samples": 48000,
-      "audio_sec": 2.0,
-      "rtf": 0.20917735099999998,
-      "toks_per_sec": 59.757903713007636
-    },
-    {
-      "ttfc_ms": 17.213858,
-      "total_ms": 418.423327,
-      "samples": 48000,
-      "audio_sec": 2.0,
-      "rtf": 0.20921166349999998,
-      "toks_per_sec": 59.74810290631813
-    },
-    {
-      "ttfc_ms": 17.211464,
-      "total_ms": 418.472934,
-      "samples": 48000,
-      "audio_sec": 2.0,
-      "rtf": 0.209236467,
-      "toks_per_sec": 59.7410201922402
-    }
-  ],
-  "stats": {
-    "ttfc_ms": {
-      "mean": 17.1977904,
-      "pstdev": 0.023243843680423475,
-      "min": 17.160951,
-      "max": 17.222243
-    },
-    "total_ms": {
-      "mean": 418.4144146,
-      "pstdev": 0.04904326263862011,
-      "min": 418.354702,
-      "max": 418.472934
-    },
-    "rtf": {
-      "mean": 0.2092072073,
-      "pstdev": 2.4521631319310436e-05,
-      "min": 0.20917735099999998,
-      "max": 0.209236467
-    },
-    "toks_per_sec": {
-      "mean": 59.749376386499016,
-      "pstdev": 0.007003450248787074,
-      "min": 59.7410201922402,
-      "max": 59.757903713007636
-    }
+  "decode_tok_per_s": {
+    "samples": [],
+    "mean": 0.0,
+    "stdev": 0.0,
+    "min": 0.0,
+    "max": 0.0
   },
-  "notes": "End-to-end bench: talker (megakernel) \u2192 code_predictor (PyTorch, real) \u2192 codec (STUB sine). TTFC measured from generate() call to first PCM chunk after cuda.synchronize. RTF = total wall / audio duration (12.5 Hz codec * 1920 samples = 80ms/frame). Codec is a sine-wave stub \u2014 speed numbers honest but audio is not speech. Talker uses single-axis MRoPE table (math-equivalent to vanilla 1D RoPE \u03b8=1M for decode-only)."
+  "ttfc_ms": {
+    "samples": [
+      56.256915,
+      56.510365,
+      56.256355
+    ],
+    "mean": 56.34121166666667,
+    "stdev": 0.11960968754894252,
+    "min": 56.256355,
+    "max": 56.510365
+  },
+  "rtf": {
+    "samples": [
+      0.3194017062497778,
+      0.31976886035067764,
+      0.3195577351561951
+    ],
+    "mean": 0.3195761005855502,
+    "stdev": 0.00015045154302617783,
+    "min": 0.3194017062497778,
+    "max": 0.31976886035067764
+  },
+  "audio_duration_ms_per_run": [
+    5120.0,
+    5120.0,
+    5120.0
+  ],
+  "decode_wall_ms_per_run": [
+    1635.3367359988624,
+    1637.2165649954695,
+    1636.135603999719
+  ],
+  "notes": []
 }
