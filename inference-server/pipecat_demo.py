@@ -201,12 +201,6 @@ class WavFileInputProcessor(FrameProcessor):
         self._realtime = realtime
         self._task = None
 
-    async def start(self, frame: StartFrame) -> None:
-        await super().start(frame)
-        # Begin pumping on the pipeline event loop. We hold a reference so
-        # cleanup can cancel cleanly.
-        self._task = self.create_task(self._pump(), name="wav-input-pump")
-
     async def cleanup(self) -> None:
         if self._task is not None:
             await self.cancel_task(self._task, timeout=2.0)
@@ -282,6 +276,12 @@ class WavFileInputProcessor(FrameProcessor):
         # the pipeline source) without modification.
         await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
+        # In pipecat 1.x there is no FrameProcessor.start() override hook
+        # -- the framework dispatches StartFrame via a private __start. We
+        # piggy-back on process_frame: the moment the StartFrame reaches us
+        # (downstream direction), we kick off the WAV pump task.
+        if isinstance(frame, StartFrame) and self._task is None:
+            self._task = self.create_task(self._pump(), name="wav-input-pump")
 
 
 def _save_wav(path: str, audio: bytes, sample_rate: int, num_channels: int) -> None:
