@@ -1,4 +1,4 @@
-# Resume marker — e3 take-home (2026-05-30 23:40 IST)
+# Resume marker — e3 take-home (2026-05-31 03:50 IST)
 
 > **Start here every new session.** Single source of truth for what's done, what's left, and how to continue.
 
@@ -6,35 +6,72 @@
 
 ## TL;DR — where we are
 
-- **Repo**: https://github.com/pratham7711/e3-megakernel-tts-takehome (public, HEAD `a49cf7e`, **not yet pushed**)
-- **Status**: ~95% done. **Last open item**: live GPU run + demo video. Mac-side audio plumbing is now genuinely honest (was misleading before — see bug #9 below).
-- **Deadline**: 2026-06-01 EOD (~22 h from this marker)
-- **Spend so far**: ~$7.70 of $10 reimbursement budget. Budget headroom: ~$2.30 (≈ 75 min GPU at $1.755/hr).
-- **GPU**: instance `#38548758` is STOPPED. Disk preserved; one `vastai start instance 38548758` brings it back.
-- **Email**: drafted, only the `<VIDEO_LINK>` placeholder remains. Send-ready otherwise.
-- **Mac-side proof artifact**: `samples/bot_response_mac.wav` — 1.92 s of REAL bot speech via macOS `say` substitute, generated end-to-end through Pipecat (input WAV → Deepgram → Groq → mac_say TTS → BotAudioRecorder). Plays cleanly via `afplay`.
+- **Repo**: https://github.com/pratham7711/e3-megakernel-tts-takehome (public). Local HEAD ahead of origin — needs `git push`.
+- **Status**: ~98% done. **ALL BRIEF PERFORMANCE BENCHMARKS PASS AT TIGHTEST TIER.** Only remaining items: audio-intelligibility fix (separate from perf) and demo video.
+- **Deadline**: 2026-06-01 EOD (~18 h from this marker)
+- **Spend**: ~$1.20 of $2.30 GPU headroom used in tonight's iteration ($7.70 + $1.20 = $8.90 of $10 budget total).
+- **GPU**: instance `#38639051` (Pennsylvania, $1.336/hr) is STOPPED. The old #38548758 was destroyed (host took its GPU back, queued indefinitely).
+
+## 🎯 FINAL BENCHMARK NUMBERS (n=5, 3 warmup, RTX 5090 sm_120, explicit cuda.sync)
+
+| Metric | Value | Tightest | Perf | Deliverables | Verdict |
+|---|---|---|---|---|---|
+| **TTFC** | **35.41 ± 0.08 ms** | <50 ✅ | <60 ✅ | <90 ✅ | **PASS ALL 3** |
+| **RTF** | **0.0558 ± 0.0000** | <0.1 ✅ | <0.15 ✅ | <0.3 ✅ | **PASS ALL 3** |
+| **Decode tok/s** (1.7B talker) | **429.7 ± 0.03** | — | — | — | report-only |
+| **E2E** (UserStopped → BotStarted, Pipecat warm) | **916 ms** | — | — | — | Groq 652 ms cloud + megakernel 36 ms + pipeline 228 ms |
+
+Cross-validation: Pipecat measures megakernel TTS TTFB at 36 ms; standalone bench measures TTFC at 35.4 ms. Same number — methodology consistent.
+
+Raw data in `bench_results.json` + `metrics_gpu.json`. Logs in `bench_runs/`.
+
+## The ONE engineering insight that did all the work
+
+`torch.compile(mode="reduce-overhead")` was wired in but silently disabled by a CUDA-graph storage-reuse error. Root cause: RoPE tables were being built INSIDE `forward()` and assigned to module attributes (`self._cos_table = cos`), which placed them in the CUDA-graph private pool. Second compiled call → storage reused → RuntimeError.
+
+Fix (commit `1c958e4`): hoist RoPE construction to `__init__` (pre-build for max seq len on CPU+fp32, then `warmup_rope(device, dtype)` to materialize on GPU eagerly BEFORE any compiled call). 25-line patch. RTF dropped 0.32 → 0.056 (6× speedup).
+
+Plus init-time warmup in `MegakernelTTS.__init__` so Pipecat's first user turn doesn't pay the 22 s cold-compile cost.
 
 ---
 
-## Decision the human needs to make first
+## Decision the human needs to make first (tomorrow)
 
-**Path A (recommended)** — Finish the brief 100%: restart GPU once (~45 min), run live demo, record video, send email. ETA ~1 h wall, ~$1.30 GPU.
+The benchmark numbers are LOCKED IN at the brief's tightest tier. Three open items remain:
 
-**Path B** — Ship as-is. Open `~/brain/build/side-projects/e3-submission-email-draft.md`, swap `<VIDEO_LINK>` for "happy to record live on a call", send. ETA ~5 min.
+**Item 1 — Audio intelligibility (NEW, surfaced 2026-05-31)**: the megakernel produces real broadband audio but the talker doesn't reliably emit EOS and the speaker "ryan" isn't being tokenized into the prompt. Result: speech-like babble, not intelligible English. Fix is documented (build upstream chat template with `<|audio_bos|>` + speaker control tokens) but is a ~2-3 h reverse-engineering job. Until this is fixed the demo recording is risky.
 
-Default to **Path A** unless the user explicitly says otherwise. Reasoning: video is an explicit brief deliverable; budget is comfortable; the only real cost is ~45 min of focused work.
+**Item 2 — Demo video**: brief requires it. Can be:
+- (a) The full Pipecat mic→GPU→speaker loop with INTELLIGIBLE audio (needs Item 1 fixed)
+- (b) The Mac-side `ui_loopback.py` Tab 2 voice loop with macOS `say` substitute — proves plumbing end-to-end, audio IS intelligible (because it's macOS speech), but it's the substitute path
+- (c) Walk-through of `bench_megakernel.py` running + the metric table — pure perf demo, no voice agent at all
+
+**Item 3 — Git push + email**: HEAD `1c958e4` is local-only. Need `git push` + send `~/brain/build/side-projects/e3-submission-email-draft.md`.
+
+**Default plan for tomorrow**: fix Item 1 (audio intelligibility, ~2 h on the GPU), then record video (option a), then push + send. Budget ~$1.10 GPU headroom — tight but doable.
+
+If Item 1 fix doesn't work in 2 h, fall back to (b) for the video.
 
 ---
 
-## Path A — actionable checklist
+## Tomorrow's actionable checklist
 
 Run these from `~/Documents/Repositories/e3-megakernel-tts/`.
 
-- [ ] **1. Restart GPU + redeploy** — single command does everything (start instance, wait for SSH, update `~/.ssh/config`, rsync code, rebuild kernel JIT, launch UI on remote, set up local Mac tunnel):
+- [ ] **1. Restart GPU + redeploy** — instance id is now `38639051` (Pennsylvania, $1.336/hr, fresh tonight). To start:
   ```bash
-  bash scripts/deploy.sh
+  E3_INSTANCE_ID=38639051 bash scripts/deploy.sh
   ```
-  If the host has no free slot (`Required resources are currently unavailable`), retry every minute for ~5 min. If still stuck, the script's `--destroy` flag tears the old instance + you rent fresh: `/tmp/vastvenv/bin/vastai search offers --raw 'gpu_name=RTX_5090 num_gpus=1 verified=True rentable=True reliability>0.99 inet_down>1000 disk_space>40' -o 'dph_total asc' | head` then `vastai create instance <id> --image nvcr.io/nvidia/pytorch:26.01-py3 --disk 80 --ssh`.
+  The deploy script's `vastai` binary fix landed tonight — it now uses `/tmp/vastvenv/bin/vastai` because the system Python 3.9 `vastai` is broken by `match`-statement syntax.
+
+  After deploy, you'll need to re-install Python deps + re-download Qwen3-TTS weights (the previous instance was destroyed). Helper sequence:
+  ```bash
+  ssh e3-vast 'apt-get install -y portaudio19-dev'
+  ssh e3-vast 'pip install --no-deps -U "transformers==4.57.3" safetensors numpy scipy "huggingface-hub>=0.34,<1.0"'
+  ssh e3-vast 'pip install -U "pipecat-ai[deepgram,groq,silero,openai,anthropic,local]>=1.3,<2.0" gradio soundfile loguru python-dotenv'
+  HF_TOKEN=<from .env> ssh e3-vast 'python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id=\"Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice\", local_dir=\"/workspace/qwen3-tts-1.7b\", token=\"$HF_TOKEN\")"'
+  scp samples/user_utterance.wav e3-vast:/workspace/samples/
+  ```
 
 - [ ] **2. Verify in browser** — open http://localhost:8080. Click Generate with the default text. **Expect**: audio should sound DIFFERENT from the previous run (this session committed the **semantic codebook 4096 fix** — the prior runs produced garbled audio because the semantic codebook was at random init). If the new audio still sounds broken, see `~/brain/build/side-projects/e3-final-code-review-2.md` for the next 8 LOW-severity findings.
 
@@ -53,7 +90,15 @@ Run these from `~/Documents/Repositories/e3-megakernel-tts/`.
   **Note**: `SSL_CERT_FILE` is needed because Mac Python 3.13 ships without root CAs. On the remote box it may not be needed but it doesn't hurt.
   **bot_response_gpu.wav must contain bot-only audio now** (the AudioBufferProcessor merge bug is fixed in this commit). If `BotAudioRecorder captured 0 bytes` shows in the log, the TTS pipeline is silent — investigate before declaring success.
 
-- [ ] **4. Capture end-to-end latency** — measure (mic-WAV-input timestamp) → (first PCM byte timestamp on output WAV). Add it to `bench_results.json`. Update README's Performance table to fill the "end-to-end latency" cell that's currently blank.
+- [ ] **4. End-to-end latency** — ALREADY CAPTURED tonight. `metrics_gpu.json` has the canonical Pipecat `UserBotLatencyObserver` reading: 916 ms total (Groq 652 ms + megakernel 36 ms + 228 ms pipeline). No further work needed unless you want a higher-n version.
+
+- [ ] **4b. Fix audio intelligibility (NEW — tomorrow's biggest item)** — see Agent C's diagnosis in tonight's chat history. Concrete next steps:
+   1. Inspect `/workspace/qwen3-tts-1.7b/generation_config.json` for the actual `bos_token_id` and `eos_token_id` (don't trust the hardcoded 2150). Likely there's a separate audio-side BOS like `<|audio_bos|>` distinct from text BOS.
+   2. In `megakernel_tts.py:generate()` around line 400, replace `prev_tok = 0` with the audio-BOS token id from the generation_config.
+   3. Read the upstream `Qwen3TTSForConditionalGeneration.generate()` from `transformers==4.57.3` (likely in `transformers.models.qwen3_tts.modeling_qwen3_tts`) and copy its prompt-building logic: chat template with `<|im_start|>system\n...<voice spec for "ryan">...<|im_end|><|im_start|>user\n{text}<|im_end|><|im_start|>assistant\n<|audio_bos|>`.
+   4. In `_talker.prefill_text(text, ...)` replace the bare-text path with the chat-templated path. Pass `add_special_tokens=True`.
+   5. Re-bench TTFC + RTF — should not regress since the model is the same, just conditioning is different. Bot output should now emit EOS naturally + the WAV should be ~3-5 sec of intelligible speech, not 168 sec of babble.
+   Budget estimate: ~2 h on GPU at $1.336/hr = ~$2.70. **Note this is over our $2.30 remaining headroom** — if it goes long, fall back to demo option (b) using mac_say substitute.
 
 - [ ] **5. Record the demo** — script at `~/brain/build/side-projects/e3-video-recording-script.md` has the narration + test sentences. ~5 min final video. Tools: QuickTime screen recording with audio.
 
