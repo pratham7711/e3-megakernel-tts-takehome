@@ -1,0 +1,38 @@
+2026-05-30 22:22:17.462 | INFO     | megakernel_tts:__init__:165 - MegakernelTTS init: model=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice path=/workspace/qwen3-tts-1.7b speaker=ryan device=cuda stub=False
+2026-05-30 22:22:20.232 | INFO     | megakernel_tts:__init__:210 - MegakernelTTS: Decoder loaded from /workspace/qwen3-tts-1.7b
+2026-05-30 22:22:22.733 | INFO     | megakernel_tts:__init__:223 - MegakernelTTS: code_predictor + codec loaded via qwen3_tts_components.load_components()
+2026-05-30 22:22:22.733 | INFO     | __main__:bench_ttfc:246 - TTFC bench: warmup=3 timed=5
+The tokenizer you are loading from '/workspace/qwen3-tts-1.7b' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+2026-05-30 22:22:27.532 | INFO     | megakernel_tts:_build_per_frame_fn:284 - MegakernelTTS: per-frame fn wrapped in torch.compile(mode='reduce-overhead').
+2026-05-30 22:22:44.081 | INFO     | __main__:bench_ttfc:253 -   run 0: TTFC=35.4 ms
+2026-05-30 22:22:44.117 | INFO     | __main__:bench_ttfc:253 -   run 1: TTFC=35.5 ms
+2026-05-30 22:22:44.153 | INFO     | __main__:bench_ttfc:253 -   run 2: TTFC=35.5 ms
+2026-05-30 22:22:44.189 | INFO     | __main__:bench_ttfc:253 -   run 3: TTFC=35.3 ms
+2026-05-30 22:22:44.225 | INFO     | __main__:bench_ttfc:253 -   run 4: TTFC=35.4 ms
+2026-05-30 22:22:44.225 | INFO     | __main__:bench_rtf:310 - RTF bench: warmup=3 timed=5
+2026-05-30 22:22:45.373 | INFO     | __main__:bench_rtf:322 -   run 0: wall=285.8ms audio=5120.0ms RTF=0.0558
+2026-05-30 22:22:45.659 | INFO     | __main__:bench_rtf:322 -   run 1: wall=285.8ms audio=5120.0ms RTF=0.0558
+2026-05-30 22:22:45.946 | INFO     | __main__:bench_rtf:322 -   run 2: wall=285.7ms audio=5120.0ms RTF=0.0558
+2026-05-30 22:22:46.232 | INFO     | __main__:bench_rtf:322 -   run 3: wall=285.8ms audio=5120.0ms RTF=0.0558
+2026-05-30 22:22:46.518 | INFO     | __main__:bench_rtf:322 -   run 4: wall=285.6ms audio=5120.0ms RTF=0.0558
+2026-05-30 22:22:46.518 | INFO     | __main__:bench_decode_tok_per_s:162 - Decode tok/s bench: model=/workspace/qwen3-tts-1.7b warmup=3 timed=5 tokens=100
+2026-05-30 22:22:48.038 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 0: 0.233s -> 429.8 tok/s
+2026-05-30 22:22:48.271 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 1: 0.233s -> 429.8 tok/s
+2026-05-30 22:22:48.505 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 2: 0.233s -> 429.7 tok/s
+2026-05-30 22:22:48.738 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 3: 0.233s -> 429.7 tok/s
+2026-05-30 22:22:48.971 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 4: 0.233s -> 429.7 tok/s
+2026-05-30 22:22:48.972 | INFO     | __main__:main_async:429 - Wrote bench_results.json
+================================================================
+ Megakernel Qwen3-TTS bench results
+================================================================
+ model         : Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+ speaker       : ryan
+ device        : cuda
+ sample rate   : 24000 Hz
+ stub          : False
+
+ Decode tok/s       : 429.7 +/- 0.0 tok/s  (min=429.7, max=429.8, n=5)
+ TTFC               : 35.4 +/- 0.1 ms  (min=35.3, max=35.5, n=5)
+ RTF                : 0.0558 +/- 0.0000   (min=0.0558, max=0.0558, n=5)
+
+================================================================

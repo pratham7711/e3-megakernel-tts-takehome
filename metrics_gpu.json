@@ -1,21 +1,21 @@
 [
   {
     "kind": "user_bot_latency_s",
-    "value": 4.100595712661743
+    "value": 0.9162139892578125
   },
   {
     "kind": "latency_breakdown",
-    "user_turn_secs": 0.12294602394104004,
+    "user_turn_secs": 0.17239069938659668,
     "ttfb": [
       {
         "processor": "GroqLLMService#0",
         "model": "llama-3.1-8b-instant",
-        "ms": 573.6532211303711
+        "ms": 652.306318283081
       },
       {
         "processor": "MegakernelTTSService#0",
         "model": "",
-        "ms": 3283.876657485962
+        "ms": 35.86864471435547
       }
     ]
   }

@@ -225,6 +225,63 @@ class MegakernelTTS:
             "qwen3_tts_components.load_components()"
         )
 
+        # Warm up RoPE tables on the target device/dtype BEFORE torch.compile
+        # traces. If the tables get materialised inside the compiled function,
+        # they end up in the CUDA-graph private pool and the second compiled
+        # call hits a "storage overwritten" runtime error. Building them
+        # eagerly here places them in the normal allocator pool.
+        target_device = torch.device(self.config.device)
+        target_dtype = torch.bfloat16
+        self._code_predictor.warmup_rope(target_device, target_dtype)
+        if hasattr(self._codec, "pre_transformer") and self._codec.pre_transformer is not None:
+            self._codec.pre_transformer.warmup_rope(target_device, target_dtype)
+
+        # Trigger torch.compile graph capture + prefill_text warmup NOW so the
+        # first run_tts() call in production doesn't pay the cold-start cost.
+        # Bench harness gets this for free via its 3 warmup generate() calls;
+        # Pipecat e2e is a one-shot, so without this the canonical
+        # UserStopped → BotStarted latency would be dominated by compile time.
+        if self.config.compile_per_frame:
+            try:
+                logger.info(
+                    "MegakernelTTS: pre-warming compile + prefill_text "
+                    "(this takes ~20-25 s at model load, amortizes per-turn)…"
+                )
+                t0 = time.perf_counter()
+                # Phase 1: per-frame fn compile + CUDA graph capture (3 iters,
+                # token id 0). ``_call`` handles cudagraph_mark_step_begin.
+                per_frame = self._build_per_frame_fn()
+                for _ in range(3):
+                    _ = per_frame(0)
+                logger.info(
+                    "MegakernelTTS: per-frame compile warmup done in {s:.1f} s",
+                    s=time.perf_counter() - t0,
+                )
+                # Phase 2: prefill_text warmup. The talker's prefill_text
+                # triggers a PyTorch forward through the text-projection
+                # submodule on first call — ~1.5 s cold, <50 ms warm. Do it
+                # now under a dummy utterance so the user's first turn is fast.
+                t1 = time.perf_counter()
+                try:
+                    self._talker.prefill_text("Hello there.", model_path=self.config.model_path)
+                    self._talker.reset()
+                    logger.info(
+                        "MegakernelTTS: prefill_text warmup done in {s:.2f} s",
+                        s=time.perf_counter() - t1,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "MegakernelTTS: prefill_text warmup failed ({err!r}); "
+                        "first generate() call will pay the prefill compile cost.",
+                        err=e,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "MegakernelTTS: compile warmup failed ({err!r}); first "
+                    "run_tts() will pay the compile cost.",
+                    err=e,
+                )
+
     @property
     def sample_rate(self) -> int:
         """Output PCM sample rate (24 kHz for Qwen3-TTS)."""

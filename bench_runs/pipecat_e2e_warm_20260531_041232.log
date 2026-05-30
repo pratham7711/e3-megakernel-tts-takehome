@@ -1,0 +1,34 @@
+2026-05-30 22:40:41.941 | INFO     | pipecat:<module>:14 - ᓚᘏᗢ Pipecat 1.3.0 (Python 3.12.3 (main, Nov  6 2025, 13:44:16) [GCC 13.3.0]) ᓚᘏᗢ
+2026-05-30 22:40:44.272 | INFO     | __main__:_build_llm:197 - LLM: Groq model=llama-3.1-8b-instant
+2026-05-30 22:40:44.297 | INFO     | megakernel_tts:__init__:165 - MegakernelTTS init: model=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice path=/workspace/qwen3-tts-1.7b speaker=ryan device=cuda stub=False
+2026-05-30 22:40:47.463 | INFO     | megakernel_tts:__init__:210 - MegakernelTTS: Decoder loaded from /workspace/qwen3-tts-1.7b
+2026-05-30 22:40:49.934 | INFO     | megakernel_tts:__init__:223 - MegakernelTTS: code_predictor + codec loaded via qwen3_tts_components.load_components()
+2026-05-30 22:40:49.934 | INFO     | megakernel_tts:__init__:246 - MegakernelTTS: pre-warming compile + prefill_text (this takes ~20-25 s at model load, amortizes per-turn)…
+2026-05-30 22:40:51.847 | INFO     | megakernel_tts:_build_per_frame_fn:330 - MegakernelTTS: per-frame fn wrapped in torch.compile(mode='reduce-overhead').
+2026-05-30 22:41:09.505 | INFO     | megakernel_tts:__init__:256 - MegakernelTTS: per-frame compile warmup done in 19.6 s
+The tokenizer you are loading from '/workspace/qwen3-tts-1.7b' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+2026-05-30 22:41:11.255 | INFO     | megakernel_tts:__init__:268 - MegakernelTTS: prefill_text warmup done in 1.75 s
+2026-05-30 22:41:11.255 | INFO     | megakernel_tts_service:__init__:125 - MegakernelTTSService ready: model=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice speaker=ryan device=cuda source_rate=24000 stub=False
+2026-05-30 22:41:11.379 | INFO     | __main__:run:641 - INPUT_MODE=file stub=False stub_mode=None speaker=ryan
+/workspace/inference-server/pipecat_demo.py:550: DeprecationWarning: PipelineTask is deprecated, use PipelineWorker instead.
+  task = PipelineTask(
+/workspace/inference-server/pipecat_demo.py:567: DeprecationWarning: PipelineRunner is deprecated, use WorkerRunner instead.
+  runner = PipelineRunner()
+/workspace/inference-server/pipecat_demo.py:569: DeprecationWarning: Passing a worker to WorkerRunner.run() is deprecated; register it with WorkerRunner.add_workers() before calling run() instead.
+  await runner.run(task)
+2026-05-30 22:41:11.382 | INFO     | __main__:_pump:295 - WavFileInputProcessor: pumping /workspace/samples/user_utterance.wav (16000 Hz, 1 ch, 40624 frames, 20 ms chunks)
+2026-05-30 22:41:11.402 | ERROR    | pipecat.services.settings:validate_complete:336 - TTSSettings: the following fields are NOT_GIVEN: model, voice, language. All settings fields should be initialized in the service's __init__ (use None for unsupported fields).
+2026-05-30 22:41:14.065 | INFO     | __main__:_pump:342 - WavFileInputProcessor: input exhausted, draining for 12.0s
+2026-05-30 22:41:14.236 | WARNING  | pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy:_handle_vad_user_stopped_speaking:178 - TurnAnalyzerUserTurnStopStrategy#0: VAD stop_secs (0.0s) differs from the recommended default (0.2s). Built-in p99 latency values assume stop_secs=0.2. Re-run https://github.com/pipecat-ai/stt-benchmark with your settings and pass the TTFS P99 latency result as ttfs_p99_latency to your STT service.
+2026-05-30 22:41:14.966 | INFO     | megakernel_tts_service:run_tts:171 - MegakernelTTSService TTFC=35.9 ms (context=98d94686-7ecb-40bf-8cda-0cdcf3111eb5)
+2026-05-30 22:41:14.986 | INFO     | __main__:_on_latency:382 - [E2E] UserStoppedSpeaking → BotStartedSpeaking: 916 ms
+2026-05-30 22:41:14.986 | INFO     | __main__:_on_breakdown:399 - [E2E] per-service TTFB: GroqLLMService#0 (llama-3.1-8b-instant) = 652 ms
+2026-05-30 22:41:14.986 | INFO     | __main__:_on_breakdown:399 - [E2E] per-service TTFB: MegakernelTTSService#0 = 36 ms
+2026-05-30 22:41:15.055 | WARNING  | pipecat.audio.vad.vad_controller:_audio_idle_handler:210 - VADController#0: no audio received while speaking, forcing speech stop
+2026-05-30 22:41:59.081 | WARNING  | pipecat.pipeline.worker:_idle_timeout_detected:1216 - Idle timeout detected.
+2026-05-30 22:41:59.082 | WARNING  | pipecat.pipeline.worker:_idle_timeout_detected:1221 - Idle pipeline detected, cancelling pipeline worker...
+2026-05-30 22:41:59.082 | WARNING  | pipecat.pipeline.worker:_idle_timeout_detected:1224 - ...and cancelling the runner.
+2026-05-30 22:42:02.086 | WARNING  | pipecat.utils.asyncio.task_manager:cancel_task:198 - MegakernelTTSService#0::__input_frame_task_handler: timed out waiting for task to cancel
+2026-05-30 22:42:02.087 | INFO     | __main__:_dump_metrics:428 - [E2E SUMMARY] user-bot latency n=1 mean=916 ms min=916 ms max=916 ms
+2026-05-30 22:42:02.087 | INFO     | __main__:_dump_metrics:440 - [E2E] wrote 2 metric events to /workspace/metrics_gpu.json
+2026-05-30 22:42:02.094 | INFO     | __main__:_save_wav:451 - Wrote 8087040 bytes of 24000 Hz audio to /workspace/samples/bot_response_gpu.wav

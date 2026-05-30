@@ -293,23 +293,29 @@ class CodePredictor(nn.Module):
             [nn.Linear(CP_HIDDEN_SIZE, CP_CODEBOOK_VOCAB, bias=False) for _ in range(CP_NUM_CODEBOOKS)]
         )
 
-        # Will be populated lazily in forward() to match the input dtype/device.
-        self.register_buffer("_cos_table", torch.empty(0), persistent=False)
-        self.register_buffer("_sin_table", torch.empty(0), persistent=False)
-
-    def _ensure_rope_table(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
-        need = (
-            self._cos_table.numel() == 0
-            or self._cos_table.size(0) < seq_len
-            or self._cos_table.device != device
-            or self._cos_table.dtype != dtype
+        # Pre-build RoPE tables for the max seq len at init. They live in the
+        # normal allocator pool (NOT inside the CUDA graph's private pool that
+        # torch.compile(mode="reduce-overhead") uses) which is essential — if
+        # these tensors were built inside forward() and assigned to module
+        # attributes, the second compiled call would hit the CUDA-graph
+        # storage-reuse error. Built in CPU/fp32; ``warmup_rope`` casts them
+        # to the runtime device+dtype BEFORE any compiled call.
+        cos, sin = _build_mrope_cos_sin(
+            1024, CP_HEAD_DIM, CP_ROPE_THETA, torch.device("cpu"), torch.float32
         )
-        if need:
-            cos, sin = _build_mrope_cos_sin(
-                max(seq_len, 1024), CP_HEAD_DIM, CP_ROPE_THETA, device, dtype
-            )
-            self._cos_table = cos
-            self._sin_table = sin
+        self.register_buffer("_cos_table", cos, persistent=False)
+        self.register_buffer("_sin_table", sin, persistent=False)
+
+    def warmup_rope(self, device: torch.device, dtype: torch.dtype) -> None:
+        """Move RoPE tables to device/dtype BEFORE torch.compile traces.
+
+        Must be called eagerly (not inside a compiled function) so the
+        resulting tensors live in the default allocator pool, not the
+        compile region's private CUDA-graph pool.
+        """
+        if self._cos_table.device != device or self._cos_table.dtype != dtype:
+            self._cos_table = self._cos_table.to(device=device, dtype=dtype)
+            self._sin_table = self._sin_table.to(device=device, dtype=dtype)
 
     def forward(self, talker_token_ids: torch.Tensor) -> torch.Tensor:
         """Greedy 16-codebook prediction from talker semantic token ids.
@@ -330,9 +336,11 @@ class CodePredictor(nn.Module):
         # Use the talker_token_embedding -- weight is initialised from the
         # talker's codec_embedding at load time.
         x = self.talker_token_embedding(talker_token_ids)  # (B, T, H)
-        dtype = x.dtype
 
-        self._ensure_rope_table(T, device, dtype)
+        # RoPE table is pre-built and warmed up to (device, dtype) BEFORE
+        # any compiled call. Just slice — no in-forward writes to module
+        # state, so the CUDA-graph storage-reuse class of bug can't fire.
+        assert T <= self._cos_table.size(0), f"seq_len {T} exceeds pre-built RoPE table {self._cos_table.size(0)}"
         cos = self._cos_table[:T]
         sin = self._sin_table[:T]
 
@@ -358,10 +366,9 @@ class CodePredictor(nn.Module):
         codec_head hidden state.
         """
         x = hidden
-        device = x.device
-        dtype = x.dtype
         T = x.shape[1]
-        self._ensure_rope_table(T, device, dtype)
+        device = x.device
+        assert T <= self._cos_table.size(0), f"seq_len {T} exceeds pre-built RoPE table {self._cos_table.size(0)}"
         cos = self._cos_table[:T]
         sin = self._sin_table[:T]
         for layer in self.layers:
@@ -643,22 +650,21 @@ class _PreTransformer(nn.Module):
         self.layers = nn.ModuleList([_PTLayer() for _ in range(PT_NUM_LAYERS)])
         self.norm = RMSNorm(PT_HIDDEN_SIZE, eps=PT_RMS_EPS)
         self.output_proj = nn.Linear(PT_HIDDEN_SIZE, PT_LATENT_DIM)
-        self.register_buffer("_cos_table", torch.empty(0), persistent=False)
-        self.register_buffer("_sin_table", torch.empty(0), persistent=False)
-
-    def _ensure_rope(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
-        need = (
-            self._cos_table.numel() == 0
-            or self._cos_table.size(0) < seq_len
-            or self._cos_table.device != device
-            or self._cos_table.dtype != dtype
+        # Pre-built RoPE table — same rationale as CodePredictor: keep these
+        # tensors out of the CUDA-graph private pool so torch.compile's
+        # reduce-overhead mode can capture forward() without storage-reuse
+        # errors on the second iteration.
+        cos, sin = _build_mrope_cos_sin(
+            4096, PT_HEAD_DIM, PT_ROPE_THETA, torch.device("cpu"), torch.float32
         )
-        if need:
-            cos, sin = _build_mrope_cos_sin(
-                max(seq_len, 4096), PT_HEAD_DIM, PT_ROPE_THETA, device, dtype
-            )
-            self._cos_table = cos
-            self._sin_table = sin
+        self.register_buffer("_cos_table", cos, persistent=False)
+        self.register_buffer("_sin_table", sin, persistent=False)
+
+    def warmup_rope(self, device: torch.device, dtype: torch.dtype) -> None:
+        """Move RoPE tables to device/dtype eagerly, before any compiled call."""
+        if self._cos_table.device != device or self._cos_table.dtype != dtype:
+            self._cos_table = self._cos_table.to(device=device, dtype=dtype)
+            self._sin_table = self._sin_table.to(device=device, dtype=dtype)
 
     @staticmethod
     def _sliding_mask(T: int, window: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
@@ -684,7 +690,7 @@ class _PreTransformer(nn.Module):
         # hidden: (B, T, latent=1024)
         hidden = self.input_proj(hidden)
         B, T, _ = hidden.shape
-        self._ensure_rope(T, hidden.device, hidden.dtype)
+        assert T <= self._cos_table.size(0), f"seq_len {T} exceeds pre-built RoPE table {self._cos_table.size(0)}"
         cos = self._cos_table[:T]
         sin = self._sin_table[:T]
         sliding_mask = self._sliding_mask(T, PT_SLIDING_WINDOW, hidden.device, hidden.dtype)
