@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 pipecat/
 qwen_megakernel/
+
+# Real env files (NEVER commit)
+.env
+inference-server/.env
