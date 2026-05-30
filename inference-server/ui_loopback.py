@@ -157,36 +157,62 @@ def mac_say_tts(text: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _write_temp_wav(samples: np.ndarray, sr: int) -> str:
+    """Persist samples to a temp WAV and return the path.
+
+    Gradio's Audio output accepts either a (sr, np.ndarray) tuple or a
+    filepath. File-path mode is the version-stable path: 5.x and 6.x both
+    serve the file from disk, so we side-step every "what dtype does this
+    Gradio expect" quirk by writing PCM_16 ourselves.
+    """
+    fd, path = tempfile.mkstemp(suffix=".wav", prefix="ui_loopback_")
+    os.close(fd)
+    sf.write(path, samples, sr, format="WAV", subtype="PCM_16")
+    return path
+
+
 def loopback_only(audio_input):
     """Echo the mic input back with 1 s leading silence."""
+    print(f"[loopback_only] called, audio_input is None? {audio_input is None}", flush=True)
     if audio_input is None:
         return None, "No audio captured. Click the record button and speak."
     sr, data = audio_input
+    print(f"[loopback_only] sr={sr}, dtype={data.dtype if hasattr(data, 'dtype') else type(data)}, "
+          f"shape={getattr(data, 'shape', '?')}", flush=True)
     if data is None or len(data) == 0:
         return None, "Captured 0 samples."
+    # Gradio 6.x hands back float32 in [-1, 1]; we normalise to int16 for the WAV.
     if data.dtype != np.int16:
-        # Gradio sometimes hands back float32 in [-1, 1].
-        data = np.clip(data, -1.0, 1.0)
-        data = (data * 32767.0).astype(np.int16)
+        data = (np.clip(data, -1.0, 1.0) * 32767.0).astype(np.int16)
+    # Stereo → mono if needed.
+    if data.ndim == 2:
+        data = data[:, 0]
     delay = np.zeros(sr, dtype=np.int16)
     out = np.concatenate([delay, data])
+    wav_path = _write_temp_wav(out, sr)
+    print(f"[loopback_only] wrote {len(out)} samples @ {sr} Hz to {wav_path}", flush=True)
     return (
-        (sr, out),
+        wav_path,
         f"Loopback OK: captured {len(data)} samples @ {sr} Hz "
-        f"({len(data)/sr:.2f} s). Output has 1 s leading silence then your voice.",
+        f"({len(data)/sr:.2f} s). Output is 1 s silence + your voice — "
+        f"click ▶ on the playback widget below.",
     )
 
 
 def full_pipeline(audio_input):
     """mic → Deepgram STT → Groq LLM → macOS say → browser playback."""
+    print(f"[full_pipeline] called, audio_input is None? {audio_input is None}", flush=True)
     if audio_input is None:
         return None, "No audio captured. Click the record button and speak first."
     sr, data = audio_input
+    print(f"[full_pipeline] sr={sr}, dtype={data.dtype if hasattr(data, 'dtype') else type(data)}, "
+          f"shape={getattr(data, 'shape', '?')}", flush=True)
     if data is None or len(data) == 0:
         return None, "Captured 0 samples."
     if data.dtype != np.int16:
-        data = np.clip(data, -1.0, 1.0)
-        data = (data * 32767.0).astype(np.int16)
+        data = (np.clip(data, -1.0, 1.0) * 32767.0).astype(np.int16)
+    if data.ndim == 2:
+        data = data[:, 0]
 
     # Write the mic input to a WAV in memory so we can POST it.
     buf = io.BytesIO()
@@ -200,10 +226,12 @@ def full_pipeline(audio_input):
     text, err = call_deepgram_stt(wav_bytes)
     stt_ms = (time.perf_counter() - t0) * 1000
     if err:
+        print(f"[full_pipeline] STT failed: {err}", flush=True)
         return None, f"Deepgram STT failed:\n{err}"
     if not text or not text.strip():
         return None, f"STT returned empty transcript (mic sr={sr}, samples={len(data)}). Try speaking louder / closer."
     log_lines.append(f"[STT {stt_ms:.0f} ms]  You said: {text.strip()!r}")
+    print(f"[full_pipeline] {log_lines[-1]}", flush=True)
 
     # ---- LLM ----
     t0 = time.perf_counter()
@@ -212,28 +240,38 @@ def full_pipeline(audio_input):
     if err:
         return None, "\n".join(log_lines + [f"Groq LLM failed: {err}"])
     log_lines.append(f"[LLM {llm_ms:.0f} ms]  Assistant: {reply.strip()!r}")
+    print(f"[full_pipeline] {log_lines[-1]}", flush=True)
 
     # ---- TTS (macOS say -- stand-in for megakernel TTS) ----
     t0 = time.perf_counter()
-    wav_path = mac_say_tts(reply.strip())
+    say_wav = mac_say_tts(reply.strip())
     tts_ms = (time.perf_counter() - t0) * 1000
-    if wav_path is None:
+    if say_wav is None:
         return None, "\n".join(log_lines + [f"macOS say synthesis failed."])
-    log_lines.append(f"[TTS {tts_ms:.0f} ms]  macOS `say` -> {Path(wav_path).name}")
-
-    audio, sr_out = sf.read(wav_path)
-    if audio.dtype != np.int16:
-        audio = np.clip(audio, -1.0, 1.0)
-        audio = (audio * 32767.0).astype(np.int16)
-    try:
-        os.unlink(wav_path)
-    except OSError:
-        pass
+    log_lines.append(f"[TTS {tts_ms:.0f} ms]  macOS `say` -> {Path(say_wav).name}")
+    print(f"[full_pipeline] {log_lines[-1]}", flush=True)
 
     total_ms = stt_ms + llm_ms + tts_ms
     log_lines.append(f"[TOTAL {total_ms:.0f} ms]  mic → speaker round trip (no GPU)")
 
-    return (sr_out, audio), "\n".join(log_lines)
+    # Return the WAV PATH directly — most robust across Gradio versions.
+    # The original /tmp WAV from mac_say_tts is fine; Gradio serves it.
+    return say_wav, "\n".join(log_lines)
+
+
+def system_audio_probe():
+    """Synthesise a 'hello, audio output works' clip via mac `say` and serve it.
+
+    Lets the user confirm browser/system audio output works at all,
+    independent of mic capture. If this clip plays in the browser, audio
+    output is fine and any failure is upstream (mic / API / handler).
+    """
+    print("[system_audio_probe] generating mac say WAV…", flush=True)
+    path = mac_say_tts("Hello. If you can hear this, your speakers are working.")
+    if path is None:
+        return None, "macOS say synthesis failed — Mac audio toolchain broken."
+    print(f"[system_audio_probe] wrote {path}", flush=True)
+    return path, f"Test clip generated at {path}. Click ▶ to confirm browser audio output works."
 
 
 def validate_apis():
@@ -268,7 +306,14 @@ def validate_apis():
     else:
         rows.append(["HuggingFace", "OK", f"user: {name}"])
 
-    return rows
+    # Gradio 6's Dataframe.postprocess silently drops bare list[list[str]]
+    # when headers= is set on the component. The dict form is version-stable.
+    return {"headers": ["API", "Status", "Detail"], "data": rows}
+
+
+def clear_audio():
+    """Reset mic input + playback output + status box."""
+    return None, None, ""
 
 
 # ---------------------------------------------------------------------------
@@ -286,18 +331,53 @@ with gr.Blocks(title="e3 — Voice Loop (No-GPU Test)") as demo:
         "to swap `say` for the real Qwen3-TTS pipeline."
     )
 
+    with gr.Tab("0. System audio probe (NO mic — confirm speakers work)"):
+        gr.Markdown(
+            "**Purpose:** confirm your browser + system can play any audio at "
+            "all. Click the button → a short `say` clip is generated and "
+            "**auto-plays**. If you don't hear it, the problem is browser/"
+            "system audio output (Mac volume, tab muted, output device), "
+            "not Gradio or the pipeline."
+        )
+        btn0 = gr.Button("Generate test clip", variant="primary")
+        out0 = gr.Audio(label="Test clip", autoplay=True, type="filepath", interactive=False)
+        log0 = gr.Textbox(label="Status", interactive=False,
+                          placeholder="Click the button — status will appear here.")
+        btn0.click(system_audio_probe, inputs=None, outputs=[out0, log0],
+                   show_progress="full")
+
     with gr.Tab("1. Loopback (no APIs, just mic + speaker)"):
         gr.Markdown(
             "**Purpose:** prove that the browser asks for mic permission, captures "
             "audio, and plays it back. If this fails, none of the rest will work."
+            "\n\n**Flow:** click the mic icon to record → click stop → click "
+            "**Echo my voice back** → playback starts automatically."
         )
         with gr.Row():
-            mic1 = gr.Audio(sources=["microphone"], type="numpy", label="Speak (click mic icon → record → stop)")
+            # editable=False keeps Gradio 6 in preview-player mode (with a ▶
+            # button on the recorded clip). Default editable=True swaps in
+            # the WaveSurfer trim editor which has no Play affordance.
+            mic1 = gr.Audio(
+                sources=["microphone"],
+                type="numpy",
+                editable=False,
+                interactive=True,
+                label="Speak (record → stop → use ✕ to clear)",
+            )
         with gr.Row():
             btn1 = gr.Button("Echo my voice back", variant="primary")
-        out1 = gr.Audio(label="Playback (1 s silence + your voice)", autoplay=True)
-        log1 = gr.Textbox(label="Status", interactive=False)
-        btn1.click(loopback_only, inputs=mic1, outputs=[out1, log1])
+            clear1 = gr.Button("Clear", variant="secondary")
+        out1 = gr.Audio(
+            label="Playback (1 s silence + your voice)",
+            autoplay=True,
+            type="filepath",
+            interactive=False,
+        )
+        log1 = gr.Textbox(label="Status", interactive=False,
+                          placeholder="Status appears here after Echo.")
+        btn1.click(loopback_only, inputs=mic1, outputs=[out1, log1],
+                   show_progress="full")
+        clear1.click(clear_audio, inputs=None, outputs=[mic1, out1, log1])
 
     with gr.Tab("2. Full pipeline (mic → Deepgram → Groq → say → speaker)"):
         gr.Markdown(
@@ -305,12 +385,27 @@ with gr.Blocks(title="e3 — Voice Loop (No-GPU Test)") as demo:
             "Deepgram transcribes, Groq replies, macOS `say` speaks the reply back."
         )
         with gr.Row():
-            mic2 = gr.Audio(sources=["microphone"], type="numpy", label="Speak (click mic → record → stop)")
+            mic2 = gr.Audio(
+                sources=["microphone"],
+                type="numpy",
+                editable=False,
+                interactive=True,
+                label="Speak (record → stop → use ✕ to clear)",
+            )
         with gr.Row():
             btn2 = gr.Button("Run pipeline", variant="primary")
-        out2 = gr.Audio(label="Assistant reply (via macOS say)", autoplay=True)
-        log2 = gr.Textbox(label="Per-stage log", interactive=False, lines=6)
-        btn2.click(full_pipeline, inputs=mic2, outputs=[out2, log2])
+            clear2 = gr.Button("Clear", variant="secondary")
+        out2 = gr.Audio(
+            label="Assistant reply (via macOS say)",
+            autoplay=True,
+            type="filepath",
+            interactive=False,
+        )
+        log2 = gr.Textbox(label="Per-stage log", interactive=False, lines=6,
+                          placeholder="STT / LLM / TTS timings appear here.")
+        btn2.click(full_pipeline, inputs=mic2, outputs=[out2, log2],
+                   show_progress="full")
+        clear2.click(clear_audio, inputs=None, outputs=[mic2, out2, log2])
 
     with gr.Tab("3. API health check (no audio)"):
         gr.Markdown("One-shot probe of Deepgram, Groq, and HF. No mic interaction.")
@@ -320,7 +415,8 @@ with gr.Blocks(title="e3 — Voice Loop (No-GPU Test)") as demo:
             datatype=["str", "str", "str"],
             interactive=False,
         )
-        btn3.click(validate_apis, inputs=None, outputs=out3)
+        btn3.click(validate_apis, inputs=None, outputs=out3,
+                   show_progress="full")
 
 
 if __name__ == "__main__":

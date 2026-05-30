@@ -65,6 +65,7 @@ class MegakernelTTSService(TTSService):
         speaker: str = "ryan",
         device: str = "cuda",
         stub: bool = False,
+        stub_mode: str | None = None,
         sample_rate: int | None = None,
         **kwargs,
     ) -> None:
@@ -90,6 +91,13 @@ class MegakernelTTSService(TTSService):
             push_start_frame=True,
             push_stop_frames=True,
             sample_rate=sample_rate or QWEN3_TTS_SAMPLE_RATE,
+            # Initialise stock TTSSettings fields so Pipecat's validator
+            # doesn't log a NOT_GIVEN error every run. We don't honor remote
+            # voice / model overrides — those would re-route around the
+            # megakernel — so None is the honest answer.
+            model=model_name,
+            voice=speaker,
+            language=None,
             **kwargs,
         )
 
@@ -104,6 +112,7 @@ class MegakernelTTSService(TTSService):
             speaker=speaker,
             device=device,
             stub=stub,
+            extra={"stub_mode": stub_mode} if stub_mode else {},
         )
         self._tts = MegakernelTTS(config=config)
 

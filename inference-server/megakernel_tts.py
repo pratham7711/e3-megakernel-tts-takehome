@@ -26,6 +26,7 @@ audio to its sink with minimal time-to-first-chunk (TTFC).
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -192,60 +193,35 @@ class MegakernelTTS:
             )
             return
 
-        # Real init path. Any failure here flips us into stub mode with a
-        # WARNING so the surrounding Pipecat pipeline can still smoke-test.
-        try:
-            from qwen_megakernel.model import Decoder  # type: ignore
+        # Real init path. The caller asked for the real megakernel — if any
+        # stage fails to load, RAISE so the surrounding pipeline fails loud.
+        # Silent fallback to stub once masked a regression where the file-mode
+        # smoke test "passed" but actually recorded the user's input echoed
+        # back. If you need silence-only plumbing tests, pass stub=True
+        # explicitly.
+        from qwen_megakernel.model import Decoder  # type: ignore
 
-            self._talker = Decoder(
-                model_path=self.config.model_path,
-                verbose=False,
-            )
-            logger.info("MegakernelTTS: Decoder loaded from {p}", p=self.config.model_path)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "MegakernelTTS: failed to load megakernel Decoder ({err!r}); "
-                "falling back to STUB mode.",
-                err=e,
-            )
-            self.config.stub = True
-            return
+        self._talker = Decoder(
+            model_path=self.config.model_path,
+            verbose=False,
+        )
+        logger.info("MegakernelTTS: Decoder loaded from {p}", p=self.config.model_path)
 
-        try:
-            # The component file is being written by a parallel agent; import
-            # lazily so this module stays importable on machines that don't
-            # yet have it.
-            from qwen3_tts_components import load_components  # type: ignore
+        from qwen3_tts_components import load_components  # type: ignore
+        import torch  # type: ignore
 
-            import torch  # type: ignore
-
-            # H1 fix: load_components() now returns 3-tuple (cp, codec, info)
-            # after the real-codec rewrite. Unpacking 2 silently flipped the
-            # service into STUB mode.
-            self._code_predictor, self._codec, _info = load_components(
-                weights_dir=self.config.model_path,
-                device=self.config.device,
-                dtype=torch.bfloat16,
-            )
-            logger.info(
-                "MegakernelTTS: code_predictor + codec loaded via "
-                "qwen3_tts_components.load_components()"
-            )
-        except ImportError as e:
-            logger.warning(
-                "MegakernelTTS: qwen3_tts_components not available yet "
-                "({err!r}); falling back to STUB mode. Re-init once the "
-                "parallel agent ships inference-server/qwen3_tts_components.py.",
-                err=e,
-            )
-            self.config.stub = True
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "MegakernelTTS: load_components() failed ({err!r}); "
-                "falling back to STUB mode.",
-                err=e,
-            )
-            self.config.stub = True
+        # H1 fix: load_components() now returns 3-tuple (cp, codec, info)
+        # after the real-codec rewrite. Unpacking 2 silently flipped the
+        # service into STUB mode.
+        self._code_predictor, self._codec, _info = load_components(
+            weights_dir=self.config.model_path,
+            device=self.config.device,
+            dtype=torch.bfloat16,
+        )
+        logger.info(
+            "MegakernelTTS: code_predictor + codec loaded via "
+            "qwen3_tts_components.load_components()"
+        )
 
     @property
     def sample_rate(self) -> int:
@@ -362,8 +338,13 @@ class MegakernelTTS:
             return
 
         if self.config.stub:
-            async for chunk in self._stub_generate(text):
-                yield chunk
+            stub_mode = self.config.extra.get("stub_mode", "silence")
+            if stub_mode == "mac_say":
+                async for chunk in self._mac_say_generate(text):
+                    yield chunk
+            else:
+                async for chunk in self._stub_generate(text):
+                    yield chunk
             return
 
         if self._talker is None or self._code_predictor is None or self._codec is None:
@@ -424,6 +405,80 @@ class MegakernelTTS:
 
             # Cooperatively yield to the event loop so the consumer can push
             # to its sink without head-of-line blocking the next talker step.
+            await asyncio.sleep(0)
+
+    async def _mac_say_generate(self, text: str) -> AsyncGenerator[bytes, None]:
+        """Mac-only stub: synthesize ``text`` via macOS ``say`` and stream PCM.
+
+        Lets us validate the end-to-end Pipecat pipeline on a laptop without
+        CUDA: real speech audio at 24 kHz mono int16, chunked into 80 ms
+        frames that match the codec's native frame size, so the downstream
+        BotAudioRecorder / LocalAudioOutputTransport sees frames identical
+        in shape to what the real megakernel TTS will eventually emit.
+        """
+        import subprocess
+        import tempfile
+
+        logger.warning(
+            "MegakernelTTS.generate() running in STUB mode=mac_say — using "
+            "macOS `say` as a voice substitute. Real megakernel runs on CUDA."
+        )
+
+        aiff_fd, aiff = tempfile.mkstemp(suffix=".aiff")
+        os.close(aiff_fd)
+        wav_fd, wav = tempfile.mkstemp(suffix=".wav")
+        os.close(wav_fd)
+
+        try:
+            subprocess.run(["say", "-o", aiff, text], check=True, timeout=30)
+            subprocess.run(
+                [
+                    "afconvert",
+                    "-f", "WAVE",
+                    "-d", f"LEI16@{QWEN3_TTS_SAMPLE_RATE}",
+                    "-c", "1",
+                    aiff, wav,
+                ],
+                check=True,
+                timeout=20,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("mac_say stub failed: {e!r}", e=e)
+            try:
+                os.unlink(aiff)
+                os.unlink(wav)
+            except OSError:
+                pass
+            return
+
+        with open(wav, "rb") as f:
+            # Strip the 44-byte WAV header so we yield raw PCM bytes (same
+            # shape downstream consumers expect from the real codec).
+            f.read(44)
+            audio_bytes = f.read()
+        try:
+            os.unlink(aiff)
+            os.unlink(wav)
+        except OSError:
+            pass
+
+        # Chunk into codec-frame-sized pieces so streaming behaviour
+        # mirrors the real path. 1920 samples * 2 bytes = 3840 bytes/frame.
+        bytes_per_frame = QWEN3_TTS_SAMPLES_PER_CODEC_FRAME * 2
+        n_frames = (len(audio_bytes) + bytes_per_frame - 1) // bytes_per_frame
+        logger.info(
+            "mac_say: {chars} chars -> {bytes} bytes -> {n} 80 ms frames",
+            chars=len(text),
+            bytes=len(audio_bytes),
+            n=n_frames,
+        )
+        for i in range(n_frames):
+            chunk = audio_bytes[i * bytes_per_frame:(i + 1) * bytes_per_frame]
+            if len(chunk) < bytes_per_frame:
+                # Pad the tail frame to full size so downstream framing
+                # assumptions hold.
+                chunk = chunk + b"\x00" * (bytes_per_frame - len(chunk))
+            yield chunk
             await asyncio.sleep(0)
 
     async def _stub_generate(self, text: str) -> AsyncGenerator[bytes, None]:

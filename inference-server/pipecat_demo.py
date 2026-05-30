@@ -84,12 +84,45 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
+from pipecat.frames.frames import TTSAudioRawFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService
 
 # Local-package import: pipecat_demo.py runs from inference-server/.
 from megakernel_tts_service import MegakernelTTSService
+
+
+class BotAudioRecorder(FrameProcessor):
+    """Capture ONLY TTS output to a WAV. No user-input mixing.
+
+    The brief's deliverable says the bot's TTS must be streamed out, so the
+    saved file must be the bot's audio alone. Pipecat's stock
+    AudioBufferProcessor merges user input + bot output into one buffer; that
+    looked correct in earlier smoke tests but produced files dominated by the
+    user utterance when the TTS stub returned silence, masking real
+    regressions.
+    """
+
+    def __init__(self, output_path: str, sample_rate: int, num_channels: int) -> None:
+        super().__init__()
+        self._output_path = output_path
+        self._sample_rate = sample_rate
+        self._num_channels = num_channels
+        self._chunks: list[bytes] = []
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(len(c) for c in self._chunks)
+
+    def save(self) -> None:
+        audio = b"".join(self._chunks)
+        _save_wav(self._output_path, audio, self._sample_rate, self._num_channels)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TTSAudioRawFrame) and frame.audio:
+            self._chunks.append(frame.audio)
+        await self.push_frame(frame, direction)
 
 
 # ---------------------------------------------------------------------------
@@ -264,11 +297,13 @@ class WavFileInputProcessor(FrameProcessor):
                 if self._realtime:
                     await asyncio.sleep(frame_period_s)
 
-        # Give the LLM + TTS time to react before tearing down. This is a
-        # crude but reliable heuristic for a one-shot demo; a production
-        # build would wait on a TTSStoppedFrame instead.
-        logger.info("WavFileInputProcessor: input exhausted, draining for 30s")
-        await asyncio.sleep(30.0)
+        # Give the LLM + TTS time to react before tearing down. A production
+        # build would wait on a TTSStoppedFrame; 12 s is enough for a Groq
+        # roundtrip + a ~5 s spoken reply at our codec rate without dragging
+        # the smoke-test wall-clock past a minute.
+        drain_s = float(os.environ.get("FILE_MODE_DRAIN_S", "12.0"))
+        logger.info("WavFileInputProcessor: input exhausted, draining for {d}s", d=drain_s)
+        await asyncio.sleep(drain_s)
         await self.push_frame(EndFrame())
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -360,15 +395,13 @@ async def _run_file_mode(stt, llm, tts, context, aggregators) -> None:
     output_wav = os.environ.get("OUTPUT_WAV", "/workspace/samples/bot_response.wav")
 
     wav_in = WavFileInputProcessor(input_wav, realtime=True)
-    # Record the bot's output (downstream-from-TTS audio) for offline review.
-    audio_recorder = AudioBufferProcessor(
-        sample_rate=24_000,  # Qwen3-TTS native
+    # Capture ONLY the bot's TTS frames so the saved WAV honestly reflects
+    # what the megakernel produced — not the user's input mixed in.
+    bot_recorder = BotAudioRecorder(
+        output_path=output_wav,
+        sample_rate=24_000,
         num_channels=1,
     )
-
-    @audio_recorder.event_handler("on_audio_data")
-    async def _on_audio(_buf, audio: bytes, sample_rate: int, num_channels: int):
-        _save_wav(output_wav, audio, sample_rate, num_channels)
 
     user_aggregator, assistant_aggregator = aggregators
     pipeline = Pipeline(
@@ -378,7 +411,7 @@ async def _run_file_mode(stt, llm, tts, context, aggregators) -> None:
             user_aggregator,
             llm,
             tts,
-            audio_recorder,
+            bot_recorder,
             assistant_aggregator,
         ]
     )
@@ -392,19 +425,30 @@ async def _run_file_mode(stt, llm, tts, context, aggregators) -> None:
             audio_in_sample_rate=16_000,
             audio_out_sample_rate=24_000,
         ),
+        # Pipecat's default idle_timeout is 5 min — far too long for a
+        # one-shot file run. The WAV pump pushes EndFrame after drain_s, but
+        # the LLM+TTS path is the timeout-detection signal. 30s covers
+        # Groq+TTS for a short reply with margin.
+        idle_timeout_secs=float(os.environ.get("FILE_MODE_IDLE_TIMEOUT_S", "30.0")),
     )
-
-    await audio_recorder.start_recording()
 
     runner = PipelineRunner()
     await runner.run(task)
 
-    await audio_recorder.stop_recording()
+    if bot_recorder.total_bytes == 0:
+        logger.warning(
+            "BotAudioRecorder captured 0 bytes — no TTSAudioRawFrame reached the recorder. "
+            "Did the LLM emit a reply? Is the TTS stubbed and producing empty frames?"
+        )
+    bot_recorder.save()
 
 
 async def run() -> None:
     """Build and run the voice pipeline."""
-    load_dotenv(override=True)
+    # Do NOT override shell env: callers (e.g. agents flipping MEGAKERNEL_STUB=1
+    # to exercise plumbing without a GPU) must be able to win over the
+    # committed .env defaults.
+    load_dotenv(override=False)
     logger.remove()
     logger.add(sys.stderr, level=os.environ.get("LOG_LEVEL", "INFO"))
 
@@ -413,7 +457,17 @@ async def run() -> None:
         logger.error("INPUT_MODE must be 'mic' or 'file', got {m!r}", m=input_mode)
         sys.exit(2)
 
-    stub = os.environ.get("MEGAKERNEL_STUB", "0") == "1"
+    # MEGAKERNEL_STUB accepts:
+    #   "0"        -> real megakernel (requires CUDA)
+    #   "1" / "silence"  -> silence frames (plumbing test, no audio)
+    #   "mac_say"  -> macOS `say` voice (real audio for Mac e2e validation)
+    raw_stub = os.environ.get("MEGAKERNEL_STUB", "0").lower()
+    stub_mode = {
+        "0": None, "": None,
+        "1": "silence", "silence": "silence",
+        "mac_say": "mac_say", "macsay": "mac_say",
+    }.get(raw_stub, "silence")
+    stub = stub_mode is not None
     speaker = os.environ.get("MEGAKERNEL_SPEAKER", "ryan")
 
     # ---- Services -------------------------------------------------------
@@ -431,6 +485,7 @@ async def run() -> None:
             speaker=speaker,
             device=os.environ.get("MEGAKERNEL_DEVICE", "cuda"),
             stub=stub,
+            stub_mode=stub_mode,
         )
     except Exception as exc:  # noqa: BLE001 - surface ALL init failures clearly
         logger.exception(
@@ -448,7 +503,10 @@ async def run() -> None:
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
-    logger.info("INPUT_MODE={m} stub={s} speaker={sp}", m=input_mode, s=stub, sp=speaker)
+    logger.info(
+        "INPUT_MODE={m} stub={s} stub_mode={sm} speaker={sp}",
+        m=input_mode, s=stub, sm=stub_mode, sp=speaker,
+    )
 
     if input_mode == "mic":
         await _run_mic_mode(stt, llm, tts, context, aggregators)
