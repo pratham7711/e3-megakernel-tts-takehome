@@ -67,15 +67,23 @@ ssh -p <port> root@<host>
 
 ```bash
 cd /workspace
-git clone <this-repo> e3-megakernel-tts
-cd e3-megakernel-tts/qwen_megakernel_modified
-pip install -r requirements.txt safetensors
-pip install -r ../inference-server/requirements.txt   # pipecat, deepgram, groq, etc.
+git clone https://github.com/pratham7711/e3-megakernel-tts-takehome.git e3-megakernel-tts
+cd e3-megakernel-tts
+
+# Install Python deps. We DO NOT pin torch in inference-server/requirements.txt
+# because the Vast PyTorch NGC image ships 2.10.0a; downgrading would break
+# the JIT-compiled kernel ABI.
+pip install --break-system-packages safetensors transformers triton ninja accelerate
+pip install --break-system-packages -r inference-server/requirements.txt
+
+# Install the megakernel as an editable package (kernel JIT-builds on first import)
+pip install --break-system-packages -e qwen_megakernel_modified/
 ```
 
-### 3. Download weights (~3.8 GB)
+### 3. Download weights (~3.8 GB; Qwen3-TTS may be gated -- set HF_TOKEN)
 
 ```bash
+export HF_TOKEN=hf_...   # required if checkpoint is gated
 huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --local-dir /workspace/qwen3-tts-1.7b
 ```
@@ -83,37 +91,64 @@ huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 ### 4. Build + smoke-test the kernel (first JIT compile ~60 s)
 
 ```bash
-python3 -c "
+python3 - <<'PY'
 from qwen_megakernel.model import Decoder
 dec = Decoder(model_path='/workspace/qwen3-tts-1.7b')
-print('5 tokens:', [dec.step(0 if i==0 else t) for i,t in enumerate([0]*5)])
-"
+toks = [0]
+for _ in range(5):
+    toks.append(dec.step(toks[-1]))
+print('5 tokens autoregressive:', toks[1:])
+PY
 ```
 
 ### 5. Benchmark (Config A, the megakernel hot path)
 
 ```bash
 cd /workspace/e3-megakernel-tts/inference-server
-python3 bench_megakernel.py --warmup 3 --runs 5 --tokens 100
-# writes bench_megakernel_talker.json next to it
+python3 bench_megakernel.py --warmup 3 --timed 5
+# writes bench_results.json next to it (n_tokens hardcoded to 100)
 ```
 
 ### 6. UI demo (real codec, Config B)
 
 ```bash
-python3 megakernel_tts.py --serve --port 8000
-# open http://<host>:8000 in a browser, click Generate
-# writes demo_audio_real_codec.wav
+# Run on the GPU box (listens on 0.0.0.0:8080)
+PYTHONPATH=/workspace/qwen_megakernel:/workspace/inference-server \
+    python3 inference-server/ui_v2.py
+
+# From your Mac, in another terminal, tunnel the UI back:
+#   ssh -L 8080:localhost:8080 <gpu-box>
+# Then open http://localhost:8080 -- click Generate, hit the audio
+# widget's download button to save the WAV.
 ```
 
-### 7. Pipecat voice loop (Deepgram STT -> Groq LLM -> our TTS -> speaker)
+### 7. Pipecat voice loop (Deepgram STT -> Groq LLM -> our TTS -> output)
 
 ```bash
-export DEEPGRAM_API_KEY=...
-export GROQ_API_KEY=...
-python3 pipecat_demo.py
-# speak into mic; transcribed text -> Groq llama-3.1-8b-instant -> MegakernelTTS -> local speakers
+cd /workspace/e3-megakernel-tts/inference-server
+cp .env.example .env
+# Fill in DEEPGRAM_API_KEY, LLM_API_KEY (Groq), HF_TOKEN in .env
+
+# Headless GPU box: stream a pre-recorded WAV instead of a mic
+INPUT_MODE=file \
+    INPUT_WAV=../samples/user_utterance.wav \
+    OUTPUT_WAV=../samples/bot_response.wav \
+    python3 pipecat_demo.py
+
+# Workstation with a mic + portaudio:
+INPUT_MODE=mic python3 pipecat_demo.py
 ```
+
+## Visuals
+
+![UI screenshot](docs/img/ui_screenshot.png)
+*Gradio v2 UI mid-result: REAL Qwen3-TTS codec wired in, populated metric cards (TTFC 694 ms, RTF 0.347, decode 36 tok/s, 2.0 s audio).*
+
+![TTFC and RTF vs brief targets](docs/img/perf_vs_brief.png)
+*Measured TTFC and RTF for Config A (sine-wave stub) and Config B (real codec, cold) plotted against the brief's three tiers of targets.*
+
+![Real-codec output spectrum](docs/img/spectrum_real_codec.png)
+*Waveform + STFT of the ~2 s real-codec render -- multi-component spectrum (not a single sine tone), confirming the full decode path runs end-to-end. Quick stats in [docs/spectrum_stats.md](docs/spectrum_stats.md).*
 
 ## Performance -- measured numbers (n=5, 3 warmup runs, single RTX 5090)
 

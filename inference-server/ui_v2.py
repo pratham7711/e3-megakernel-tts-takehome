@@ -238,6 +238,18 @@ def generate_one(
         pass
 
     # ------------------------------------------------------------------
+    # Honest TTFC timer starts HERE -- before prefill -- so the brief's
+    # "time to first audio chunk" metric includes all setup work the user
+    # experiences (tokenize + 28-layer PyTorch prefill + first frame).
+    # The first-frame `cuda.synchronize` inside the loop closes the gate.
+    # ------------------------------------------------------------------
+    try:
+        torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001
+        pass
+    t0 = time.perf_counter()
+
+    # ------------------------------------------------------------------
     # Text prefill -- populate the megakernel KV cache from the input text
     # so that the subsequent audio decode is conditioned on the prompt.
     # ------------------------------------------------------------------
@@ -293,14 +305,7 @@ def generate_one(
     pcm_chunks: list[np.ndarray] = []
     prev_tok = 0
     ttfc_ms: float | None = None
-
-    # Explicit CUDA sync on entry so TTFC isn't credited to a leftover kernel.
-    try:
-        torch.cuda.synchronize()
-    except Exception:  # noqa: BLE001
-        pass
-
-    t0 = time.perf_counter()
+    # NB: t0 was started above before prefill (honest TTFC includes prefill).
     step_i = -1
     try:
         for step_i in range(int(frames)):

@@ -1,32 +1,62 @@
-# inference-server requirements
-# --------------------------------------------------------------------------
-# The `qwen_megakernel` package is NOT listed here -- install it on the
-# remote RTX 5090 box from the local clone:
-#     pip install -e ~/qwen_megakernel/
-# --------------------------------------------------------------------------
+# inference-server/requirements.txt
+# ---------------------------------------------------------------------------
+# Pinned 2026-05-30 against PyTorch 2.10.0a NGC nightly + transformers 4.57.3.
+# The qwen_megakernel C extension is JIT-compiled (CUDA arch sm_120,
+# torch.utils.cpp_extension) from `qwen_megakernel_modified/` -- it is NOT a
+# pip dep and intentionally not listed here.
+#
+# Install on the remote RTX 5090 box:
+#     pip install -r inference-server/requirements.txt safetensors
+#
+# Pin philosophy:
+#   * Exact (==) where the bench numbers in README.md were taken against a
+#     specific version (transformers, safetensors, soundfile, loguru,
+#     python-dotenv, numpy).
+#   * Range (>=X,<Y) where the wheel selection is driver/CUDA-dependent
+#     (torch is pulled from the NGC image, not pip) or where the upstream
+#     publishes weekly point releases we are willing to track within a major
+#     (pipecat-ai, gradio).
+# ---------------------------------------------------------------------------
 
-# Pipecat core + the two service extras we actually use.
+# --- Heavy deps (model + audio) ---------------------------------------------
+
+# Torch: the NGC PyTorch:25.01-py3 image ships 2.10.0a0+gitXXXX. We allow
+# 2.3..<2.11 so a stable image (e.g. 2.4) also satisfies. torch is normally
+# already present on the NGC box; pip will only upgrade if missing.
+torch>=2.3,<2.11
+
+# Qwen3-TTS modeling code (talker, code_predictor reference, codec spec) lives
+# in transformers >= 4.57 (Qwen3 family). 4.57.3 is the exact version we
+# validated weight loading against -- earlier 4.57 releases miss the
+# Qwen3-TTS config classes.
+transformers==4.57.3
+tokenizers>=0.20,<0.22  # transformers 4.57.x compatible range
+
+# safetensors weight loader (Decoder + codec component loader).
+safetensors==0.4.5
+
+# --- Pipecat + service extras (real-time voice loop) ------------------------
+# Range-pinned: pipecat releases weekly within the 0.0.x series. We track
+# 0.0.105+ for the LocalAudioOutputTransport API we depend on.
 pipecat-ai>=0.0.105,<0.1.0
-pipecat-ai[deepgram]>=0.0.105,<0.1.0
-pipecat-ai[anthropic]>=0.0.105,<0.1.0
-pipecat-ai[openai]>=0.0.105,<0.1.0
-pipecat-ai[silero]>=0.0.105,<0.1.0
-pipecat-ai[local]>=0.0.105,<0.1.0
+pipecat-ai[deepgram]>=0.0.105,<0.1.0   # STT
+pipecat-ai[anthropic]>=0.0.105,<0.1.0  # optional LLM
+pipecat-ai[openai]>=0.0.105,<0.1.0     # optional LLM
+pipecat-ai[groq]>=0.0.105,<0.1.0       # default LLM in pipecat_demo.py
+pipecat-ai[silero]>=0.0.105,<0.1.0     # VAD
+pipecat-ai[local]>=0.0.105,<0.1.0      # LocalAudioOutputTransport
 
-# Qwen3-TTS modeling code lives in transformers >= 4.57 (Qwen3 family).
-transformers>=4.57,<5.0
-tokenizers>=0.20
+# --- Audio I/O + arrays -----------------------------------------------------
+numpy==1.26.4         # last 1.x; 2.x not yet validated against transformers 4.57
+soundfile==0.12.1     # WAV read/write for samples/ + bench
+scipy>=1.13,<2.0      # transitively required by some pipecat audio paths
 
-# Talker / codec / code predictor all need torch. Pin the major+minor only;
-# the megakernel build script targets CUDA 12.x torch.
-torch>=2.3,<2.7
+# --- UI ---------------------------------------------------------------------
+# ui_v2.py uses Gradio Blocks + Dataframe. 4.x and 5.x have breaking API
+# differences; we wrote against 4.x.
+gradio>=4.40,<5.0
 
-# Audio I/O + array math.
-numpy>=1.26,<3.0
-soundfile>=0.12,<0.14
-
-# Pipecat's logging convention.
-loguru>=0.7,<0.8
-
-# .env loader for pipecat_demo.py
-python-dotenv>=1.0,<2.0
+# --- Dev / util -------------------------------------------------------------
+loguru==0.7.2            # Pipecat's logging convention
+python-dotenv==1.0.1     # .env loader for pipecat_demo.py
+huggingface-hub>=0.24,<1.0  # `huggingface-cli download` for `make weights`

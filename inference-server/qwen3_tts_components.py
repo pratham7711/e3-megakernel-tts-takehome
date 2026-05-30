@@ -96,7 +96,8 @@ CP_RMS_EPS = 1e-6
 CODEC_OUTPUT_SAMPLE_RATE = 24_000
 CODEC_FRAME_UPSAMPLE = 1920  # samples per frame (24 kHz / 12.5 Hz)
 CODEC_NUM_QUANTIZERS = 16
-CODEC_CODEBOOK_SIZE = 2048
+CODEC_CODEBOOK_SIZE = 2048           # acoustic codebooks (rvq_rest)
+CODEC_SEMANTIC_CODEBOOK_SIZE = 4096  # semantic codebook (rvq_first) per upstream config
 
 
 # ===========================================================================
@@ -779,16 +780,28 @@ class _ResidualVectorQuantizer(nn.Module):
 
 
 class _SplitResidualVectorQuantizer(nn.Module):
-    """rvq_first (1 semantic codebook) + rvq_rest (15 acoustic codebooks)."""
+    """rvq_first (1 semantic codebook) + rvq_rest (15 acoustic codebooks).
+
+    Codebook size note: Qwen3-TTS V2 ships with DIFFERENT semantic vs
+    acoustic codebook sizes. Per `speech_tokenizer/config.json`:
+      semantic_codebook_size = 4096
+      codebook_size          = 2048   (acoustic)
+    A prior version hardcoded 2048 for both; the semantic 4096x256
+    embedding_sum then silently landed in `unexpected_keys` and the
+    semantic codebook stayed at random init -- which corrupted the
+    decoded audio. Plumb separate args so the state_dict loads cleanly.
+    """
 
     def __init__(self, n_q: int = 16, n_q_semantic: int = 1,
                  dim: int = 256, codebook_size: int = 2048,
+                 semantic_codebook_size: int | None = None,
                  input_dim: int = 512, output_dim: int = 512) -> None:
         super().__init__()
         self.n_q_semantic = n_q_semantic
         self.n_q_acoustic = n_q - n_q_semantic
+        sem_size = semantic_codebook_size if semantic_codebook_size is not None else codebook_size
         self.rvq_first = _ResidualVectorQuantizer(
-            n_q=n_q_semantic, dim=dim, codebook_size=codebook_size,
+            n_q=n_q_semantic, dim=dim, codebook_size=sem_size,
             input_dim=input_dim, output_dim=output_dim,
         )
         self.rvq_rest = _ResidualVectorQuantizer(
@@ -886,6 +899,7 @@ class Code2WavCodec(nn.Module):
             n_q_semantic=1,
             dim=CODEC_CODEBOOK_INNER,
             codebook_size=CODEC_CODEBOOK_SIZE,
+            semantic_codebook_size=CODEC_SEMANTIC_CODEBOOK_SIZE,
             input_dim=CODEC_CODEBOOK_DIM,
             output_dim=CODEC_CODEBOOK_DIM,
         )
