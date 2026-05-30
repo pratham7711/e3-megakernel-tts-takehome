@@ -1,0 +1,32 @@
+# inference-server requirements
+# --------------------------------------------------------------------------
+# The `qwen_megakernel` package is NOT listed here -- install it on the
+# remote RTX 5090 box from the local clone:
+#     pip install -e ~/qwen_megakernel/
+# --------------------------------------------------------------------------
+
+# Pipecat core + the two service extras we actually use.
+pipecat-ai>=0.0.105,<0.1.0
+pipecat-ai[deepgram]>=0.0.105,<0.1.0
+pipecat-ai[anthropic]>=0.0.105,<0.1.0
+pipecat-ai[openai]>=0.0.105,<0.1.0
+pipecat-ai[silero]>=0.0.105,<0.1.0
+pipecat-ai[local]>=0.0.105,<0.1.0
+
+# Qwen3-TTS modeling code lives in transformers >= 4.57 (Qwen3 family).
+transformers>=4.57,<5.0
+tokenizers>=0.20
+
+# Talker / codec / code predictor all need torch. Pin the major+minor only;
+# the megakernel build script targets CUDA 12.x torch.
+torch>=2.3,<2.7
+
+# Audio I/O + array math.
+numpy>=1.26,<3.0
+soundfile>=0.12,<0.14
+
+# Pipecat's logging convention.
+loguru>=0.7,<0.8
+
+# .env loader for pipecat_demo.py
+python-dotenv>=1.0,<2.0

@@ -1,0 +1,22 @@
+{
+  "config": {
+    "num_layers": 28,
+    "hidden": 2048,
+    "intermediate": 6144,
+    "vocab": 3072
+  },
+  "tokens": 100,
+  "runs": 5,
+  "times_s": [
+    0.1988203270593658,
+    0.1987253949046135,
+    0.1987412590533495,
+    0.19875990704167634,
+    0.1987113639479503
+  ],
+  "mean_s": 0.1987516504013911,
+  "pstdev_s": 3.7960466317928996e-05,
+  "tokens_per_s_mean": 503.14047605664604,
+  "ms_per_tok_mean": 1.987516504013911,
+  "note": "vanilla-rope (MRoPE not yet impl); audio decode loop only (no prompt prefill)"
+}
