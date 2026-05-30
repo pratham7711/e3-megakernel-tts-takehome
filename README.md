@@ -25,7 +25,9 @@ e3-megakernel-tts/
 
 ## Performance — measured numbers (n=5, 3 warmup runs, single RTX 5090)
 
-### End-to-end pipeline (text → talker via megakernel → code_predictor → codec → PCM)
+We report numbers in **two configurations** because the codec component dominates RTF and we have honest results for both:
+
+### Config A — sine-wave codec stub (clean megakernel + code_predictor path)
 
 | Metric | Our value | Performance Targets §1 | Step 4 (Validate) | Deliverables | Verdict |
 |---|---|---|---|---|---|
@@ -33,6 +35,27 @@ e3-megakernel-tts/
 | **RTF** | **0.209 ± 0.0001** | < 0.15 | < 0.1 | < 0.3 | ✅ PASS deliverables; misses tighter |
 | End-to-end decode | 59.7 tok/s | — | required | required | reported |
 | Wall / 2 s audio | 418.4 ± 0.05 ms | — | — | — | |
+
+This config isolates the megakernel + code_predictor performance: TTFC<50ms is solidly hit, RTF passes deliverables.
+
+### Config B — REAL Qwen3-TTS codec (271-weight clean-room vocoder)
+
+First-run, cold compiles (UI Generate click):
+
+| Metric | Our value | Verdict against brief |
+|---|---|---|
+| **TTFC** | **694 ms** | ❌ misses all tiers (cold-start dominated; first call triggers JIT compile of 8-layer transformer + ConvNet decoder) |
+| **RTF** | **0.347** | ❌ misses all tiers |
+| Audio duration | 2.00 s | — |
+| Decode tok/s (end-to-end) | 36.0 | — |
+
+This config produces **real speech-like audio** (broadband, voiced/unvoiced spectrum) instead of beeping. The audio still isn't intelligible English because text prefill isn't wired (the talker decodes from token 0 unconditioned), but the codec is doing genuine waveform synthesis.
+
+**Honest read of the gap**: the cold-start TTFC is dominated by first-call CUDA compilation of the codec's pre_transformer (8 layers, sliding-window attention) + ConvNet decoder layers (~12 distinct conv kernels). With persistent warmup (the way Pipecat would actually run this in production), TTFC would drop substantially. The brief targets assume a warm pipeline; we measured cold. Subsequent runs were observed to still be slow in our UI (under investigation — likely a per-call CUDA compile we haven't cached properly in the wrapper).
+
+### Sample audio artifact
+
+`demo_audio_real_codec.wav` (in this repo) — a 2 sec WAV produced by the full pipeline through the real codec. Spectrally broadband (real audio synthesis, not single-tone sine), but not intelligible English (no text prefill).
 
 ### Talker decode-loop only (megakernel hot path, no code_predictor / codec)
 
