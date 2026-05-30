@@ -67,12 +67,15 @@ BUILD_FLAGS: dict[str, Any] = {
 }
 
 DISCLAIMER_TEXT = (
-    "Codec is a sine-wave stub - output sounds like beeping, not speech. "
+    "Codec is the REAL Qwen3-TTS 271-key vocoder (clean-room reimplementation). "
+    "Audio is speech-like (broadband, voiced/unvoiced) but not intelligible English "
+    "because text prefill isn't wired yet - the talker decodes from token 0 unconditioned. "
     "Talker + code_predictor compute is REAL and timing is honest."
 )
 
 HONEST_DISCLOSURES: list[str] = [
-    "Codec: sine-wave stub (496-key convnet not reverse-engineered)",
+    "Codec: REAL Qwen3-TTS V2 vocoder (271 weights, clean-room reimpl)",
+    "Text prefill NOT wired - talker runs from token 0 unconditioned, so audio isn't intelligible English yet",
     "MRoPE: single-axis collapse for decode-only path - math-equivalent to vanilla 1D RoPE theta=1M; full multi-axis NOT in kernel",
     "Bench numbers from steady-state (post-warmup)",
     "GPU: 1x RTX 5090 sm_120 Blackwell, CUDA 13.1, PyTorch 2.10.0a NGC",
@@ -228,36 +231,53 @@ def generate_one(text: str, frames: int) -> tuple[Any, RunMetrics]:
         pass
 
     t0 = time.perf_counter()
+    talker_tokens: list[int] = []
+    step_i = -1
     try:
+        # Stage 1: Talker fast loop on the megakernel — collect all
+        # semantic tokens for this utterance.
         for step_i in range(int(frames)):
             next_tok = talker.step(prev_tok)
-            tok_tensor = torch.tensor(
-                [[next_tok]], dtype=torch.long, device=device
-            )
-            code_frame = code_predictor(tok_tensor)
-            pcm = codec(code_frame)
-
-            # Defensive: codec may return bytes / ndarray / tensor.
-            if isinstance(pcm, (bytes, bytearray)):
-                arr = np.frombuffer(bytes(pcm), dtype=np.int16)
-            elif isinstance(pcm, np.ndarray):
-                arr = pcm.astype(np.int16)
-            else:
-                arr = (
-                    pcm.detach().to("cpu").numpy().astype(np.int16)
-                    if hasattr(pcm, "detach")
-                    else np.asarray(pcm).astype(np.int16)
-                )
-
-            if ttfc_ms is None:
-                try:
-                    torch.cuda.synchronize()
-                except Exception:  # noqa: BLE001
-                    pass
-                ttfc_ms = (time.perf_counter() - t0) * 1000.0
-
-            pcm_chunks.append(arr)
+            talker_tokens.append(next_tok)
             prev_tok = next_tok
+
+        # Stage 2: Code Predictor in ONE batched call (1, N, 16).
+        # Called per-frame was the original ui.py shape but produces a
+        # large constant-factor overhead per call (CUDA dispatch + Python).
+        toks_batch = torch.tensor([talker_tokens], dtype=torch.long, device=device)
+        code_frames = code_predictor(toks_batch)  # (1, N, 16)
+
+        # Stage 3: Codec in ONE batched call → (1, N*1920) PCM samples.
+        # This is dramatically faster than calling the codec per-frame because
+        # the codec's pre_transformer / decoder ConvNet have O(seq_len)
+        # operations that amortize across the batch.
+        pcm = codec(code_frames)
+
+        if ttfc_ms is None:
+            try:
+                torch.cuda.synchronize()
+            except Exception:  # noqa: BLE001
+                pass
+            ttfc_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Defensive: codec may return bytes / ndarray / tensor.
+        if isinstance(pcm, (bytes, bytearray)):
+            arr = np.frombuffer(bytes(pcm), dtype=np.int16)
+        elif isinstance(pcm, np.ndarray):
+            arr = pcm.astype(np.int16)
+        else:
+            arr = (
+                pcm.detach().to("cpu").to(torch.float32).numpy()
+                if hasattr(pcm, "detach")
+                else np.asarray(pcm)
+            )
+            # Real codec emits float audio in [-1, 1]; quantize to int16.
+            if arr.dtype != np.int16:
+                arr = np.clip(arr, -1.0, 1.0)
+                arr = (arr * 32767.0).astype(np.int16)
+        # Flatten in case codec returned a batched (1, N*1920) shape.
+        arr = arr.reshape(-1)
+        pcm_chunks.append(arr)
     except Exception as e:  # noqa: BLE001
         metrics.error = f"generate failed at step {step_i}: {e!r}"
         # Fall through: surface whatever audio we did manage to render.
@@ -489,7 +509,7 @@ def render_header_html() -> str:
                     e3 x Megakernel x Qwen3-TTS
                 </div>
                 <div style="font-size:12px; color:{TEXT_MUTED}; margin-top:4px; font-family:{MONO_FONT};">
-                    AlpinDale/qwen_megakernel - Talker decode only - PyTorch code_predictor - sine-wave codec stub
+                    AlpinDale/qwen_megakernel - Talker decode only - PyTorch code_predictor - REAL Qwen3-TTS codec (271 weights)
                 </div>
             </div>
             <div style="
@@ -511,7 +531,7 @@ def render_header_html() -> str:
             <span style="{arrow}">&rarr;</span>
             <span style="{pipeline_step}">Code Predictor (PyTorch)</span>
             <span style="{arrow}">&rarr;</span>
-            <span style="{pipeline_step}; border-color:{ACCENT_PARTIAL}55; color:{ACCENT_PARTIAL};">Codec (STUB)</span>
+            <span style="{pipeline_step}; border-color:{ACCENT_PASS}55; color:{ACCENT_PASS};">Codec (REAL)</span>
             <span style="{arrow}">&rarr;</span>
             <span style="{pipeline_step}">audio</span>
         </div>
