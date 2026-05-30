@@ -90,7 +90,20 @@ determinism, monotonic position, no OOR tokens, prompt-conditioned outputs, rese
 All 3 PASS (Deepgram, Groq llama-3.1-8b-instant, HF whoami pratham7711)
 
 ### Pipecat smoke test result
-`samples/bot_response.wav` = 237 KB, written by `pipecat_demo.py INPUT_MODE=file` agent run — **end-to-end pipeline executed at least once with WAV input and produced WAV output. Validates Deepgram + Groq + some-form-of-TTS through the Pipecat plumbing.**
+`samples/bot_response.wav` = 237 KB, **4.95 s, 24 kHz mono PCM_16, peak amp 0.48** — written by `pipecat_demo.py INPUT_MODE=file` agent run. **End-to-end pipeline executed and produced audible WAV output. Validates Deepgram + Groq + TTS through the Pipecat plumbing.**
+
+#### Two gotchas surfaced — both fixed and committed
+1. **SSL cert verify on Python 3.13** (Mac homebrew Python ships without root CAs). Mac-only run-command preamble: `SSL_CERT_FILE="$(python3 -c 'import certifi; print(certifi.where())')"`.
+2. **`Pipecat 1.3.0` removed `FrameProcessor.start()`**. Our `WavFileInputProcessor` now kicks off the pump inside `process_frame` when the first `StartFrame` arrives. Future-self: do NOT add a `.start()` override to a Pipecat 1.3+ FrameProcessor.
+
+Full repro command:
+```bash
+cd inference-server
+SSL_CERT_FILE="$(python3 -c 'import certifi; print(certifi.where())')" \
+  MEGAKERNEL_STUB=1 INPUT_MODE=file \
+  INPUT_WAV=../samples/user_utterance.wav OUTPUT_WAV=../samples/bot_response.wav \
+  python3 pipecat_demo.py
+```
 
 ## Bugs found + fixed this session
 - **H1 (CRITICAL)**: `_SplitResidualVectorQuantizer` hardcoded codebook_size=2048 for BOTH semantic and acoustic. Upstream config: semantic_codebook_size=4096. The semantic codebook stayed at random init → garbled audio. Plumbed `semantic_codebook_size=4096` through.
