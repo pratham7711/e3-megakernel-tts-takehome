@@ -206,10 +206,23 @@ def bench_decode_tok_per_s(
 
 
 async def bench_ttfc_one_pass(tts: MegakernelTTS, text: str) -> float:
-    """Time from generate() invocation to first yielded chunk, in ms."""
+    """Time from generate() invocation to first yielded chunk, in ms.
+
+    Methodology:
+    - Explicit ``cuda.synchronize()`` BEFORE timer start so any pending GPU
+      work from prior bench iterations doesn't leak into this measurement.
+    - First chunk yields raw PCM bytes -- the bytes-conversion path inside
+      ``MegakernelTTS._build_per_frame_fn`` requires a tensor.cpu().numpy()
+      hop, which is itself a CUDA sync point. So when the chunk reaches us,
+      all GPU work for that frame is already retired. We add an explicit
+      sync defensively in case a future refactor avoids the .cpu() copy.
+    """
+    import torch  # type: ignore  # local import keeps non-CUDA imports clean
+    torch.cuda.synchronize()
     t0_ns = time.perf_counter_ns()
     gen = tts.generate(text)
     async for _chunk in gen:
+        torch.cuda.synchronize()  # defensive — bytes arrival already implies sync
         elapsed_ns = time.perf_counter_ns() - t0_ns
         # Drain the rest of the generator so KV cache state is consistent
         # for the next run -- otherwise we measure prefill of a half-finished
@@ -247,11 +260,20 @@ async def bench_ttfc(
 async def bench_rtf_one_pass(
     tts: MegakernelTTS, text: str
 ) -> tuple[float, float, float]:
-    """Run one full synthesis pass, returning (rtf, wall_ms, audio_ms)."""
+    """Run one full synthesis pass, returning (rtf, wall_ms, audio_ms).
+
+    Methodology:
+    - Explicit ``cuda.synchronize()`` before timer start and after the last
+      chunk so wall time is end-to-end GPU work, no async tails leaking in
+      or out.
+    """
+    import torch  # type: ignore
+    torch.cuda.synchronize()
     total_bytes = 0
     t0 = time.perf_counter()
     async for chunk in tts.generate(text):
         total_bytes += len(chunk)
+    torch.cuda.synchronize()
     wall_s = time.perf_counter() - t0
 
     n_samples = total_bytes // 2  # int16 = 2 bytes / sample

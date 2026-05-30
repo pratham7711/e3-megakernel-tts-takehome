@@ -200,7 +200,12 @@ def loopback_only(audio_input):
 
 
 def full_pipeline(audio_input):
-    """mic → Deepgram STT → Groq LLM → macOS say → browser playback."""
+    """mic → Deepgram STT → Groq LLM → macOS say → browser playback.
+
+    Plumbing-validation only. Real benchmark numbers are produced by
+    ``bench_megakernel.py`` on the GPU box (sm_120 RTX 5090) and live in
+    ``bench_results.json`` + the README.
+    """
     print(f"[full_pipeline] called, audio_input is None? {audio_input is None}", flush=True)
     if audio_input is None:
         return None, "No audio captured. Click the record button and speak first."
@@ -214,14 +219,12 @@ def full_pipeline(audio_input):
     if data.ndim == 2:
         data = data[:, 0]
 
-    # Write the mic input to a WAV in memory so we can POST it.
     buf = io.BytesIO()
     sf.write(buf, data, sr, format="WAV", subtype="PCM_16")
     wav_bytes = buf.getvalue()
 
     log_lines = []
 
-    # ---- STT ----
     t0 = time.perf_counter()
     text, err = call_deepgram_stt(wav_bytes)
     stt_ms = (time.perf_counter() - t0) * 1000
@@ -233,7 +236,6 @@ def full_pipeline(audio_input):
     log_lines.append(f"[STT {stt_ms:.0f} ms]  You said: {text.strip()!r}")
     print(f"[full_pipeline] {log_lines[-1]}", flush=True)
 
-    # ---- LLM ----
     t0 = time.perf_counter()
     reply, err = call_groq_llm(text.strip())
     llm_ms = (time.perf_counter() - t0) * 1000
@@ -242,20 +244,19 @@ def full_pipeline(audio_input):
     log_lines.append(f"[LLM {llm_ms:.0f} ms]  Assistant: {reply.strip()!r}")
     print(f"[full_pipeline] {log_lines[-1]}", flush=True)
 
-    # ---- TTS (macOS say -- stand-in for megakernel TTS) ----
     t0 = time.perf_counter()
     say_wav = mac_say_tts(reply.strip())
     tts_ms = (time.perf_counter() - t0) * 1000
     if say_wav is None:
         return None, "\n".join(log_lines + [f"macOS say synthesis failed."])
-    log_lines.append(f"[TTS {tts_ms:.0f} ms]  macOS `say` -> {Path(say_wav).name}")
+    log_lines.append(f"[TTS {tts_ms:.0f} ms]  macOS `say` substitute -> {Path(say_wav).name}")
     print(f"[full_pipeline] {log_lines[-1]}", flush=True)
 
-    total_ms = stt_ms + llm_ms + tts_ms
-    log_lines.append(f"[TOTAL {total_ms:.0f} ms]  mic → speaker round trip (no GPU)")
+    log_lines.append(
+        f"[PLUMBING OK]  STT + LLM + TTS-substitute round-trip works. "
+        f"Real benchmark numbers come from the GPU run (bench_megakernel.py)."
+    )
 
-    # Return the WAV PATH directly — most robust across Gradio versions.
-    # The original /tmp WAV from mac_say_tts is fine; Gradio serves it.
     return say_wav, "\n".join(log_lines)
 
 
@@ -381,8 +382,15 @@ with gr.Blocks(title="e3 — Voice Loop (No-GPU Test)") as demo:
 
     with gr.Tab("2. Full pipeline (mic → Deepgram → Groq → say → speaker)"):
         gr.Markdown(
-            "**Purpose:** prove all 3 APIs work end-to-end. Speak a question. "
-            "Deepgram transcribes, Groq replies, macOS `say` speaks the reply back."
+            "**Purpose:** plumbing validation only — prove that mic capture, "
+            "Deepgram, Groq, and audio playback are all wired correctly on "
+            "this laptop before spending GPU money. macOS `say` is the TTS "
+            "stand-in here.\n"
+            "\n"
+            "**NOT a benchmark.** The brief's TTFC / RTF / decode-tok/s / "
+            "end-to-end latency are produced by `bench_megakernel.py` on the "
+            "GPU box (sm_120 RTX 5090) → see `bench_results.json` and the "
+            "README's Performance section."
         )
         with gr.Row():
             mic2 = gr.Audio(
@@ -402,7 +410,7 @@ with gr.Blocks(title="e3 — Voice Loop (No-GPU Test)") as demo:
             interactive=False,
         )
         log2 = gr.Textbox(label="Per-stage log", interactive=False, lines=6,
-                          placeholder="STT / LLM / TTS timings appear here.")
+                          placeholder="STT / LLM / TTS-substitute timings appear here.")
         btn2.click(full_pipeline, inputs=mic2, outputs=[out2, log2],
                    show_progress="full")
         clear2.click(clear_audio, inputs=None, outputs=[mic2, out2, log2])
