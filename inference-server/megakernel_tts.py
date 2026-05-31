@@ -523,23 +523,43 @@ class MegakernelTTS:
 
         per_frame = self._build_per_frame_fn()
 
-        for _ in range(max_new):
-            next_tok = self._talker.step(prev_tok)
+        # Trailing-text injection per upstream Qwen3-TTS
+        # (modeling_qwen3_tts.py:1689-1692): each AR step's input embedding
+        # is `codec_embedding[prev_tok] + trailing_text_hidden[step_idx]`
+        # (or `tts_pad_embed` once trailing_text is exhausted). This is the
+        # ongoing text-to-audio alignment that keeps the talker on-phoneme
+        # — without it the model has only seen the text once (in prefill)
+        # and drifts off into speech-like babble.
+        trailing = self._talker.trailing_text_hiddens if do_prefill else None
+        pad_emb = self._talker.tts_pad_embed() if do_prefill else None
+        import torch  # type: ignore
+        device = self.config.device
+        embed_weight = self._talker._embed_weight  # (3072, HIDDEN)
+
+        for step_idx in range(max_new):
+            # Build the talker input for THIS step. Pure embedding-space:
+            #   prev_tok's codec_embedding row  +  per-step text conditioning
+            tok_emb = torch.nn.functional.embedding(
+                torch.tensor([prev_tok], dtype=torch.long, device=device),
+                embed_weight,
+            ).view(1, 1, -1).to(torch.bfloat16)
+            if trailing is not None and trailing.shape[0] > 0:
+                if step_idx < trailing.shape[0]:
+                    text_emb = trailing[step_idx].view(1, 1, -1)
+                else:
+                    text_emb = pad_emb
+                step_input = tok_emb + text_emb.to(tok_emb.dtype)
+            else:
+                step_input = tok_emb
+
+            next_tok = self._talker.step_embed(step_input)
             if next_tok == eos:
                 break
 
-            # Run code_predictor + codec on this ONE frame and emit
-            # immediately. This is the streaming yield required by the brief.
             pcm_bytes = per_frame(next_tok)
             yield pcm_bytes
 
             prev_tok = next_tok
-            # NOTE: no asyncio.sleep(0) here. The `yield` above is already an
-            # async-generator yield point — control returns to the consumer
-            # without an extra reschedule. sleep(0) added 50-200 µs per frame
-            # (~3-13 ms per 5-sec utterance) with no head-of-line benefit
-            # because Pipecat drains at codec rate (~80 ms gap), far slower
-            # than our produce rate. Do NOT reintroduce.
 
     async def _stub_generate(self, text: str) -> AsyncGenerator[bytes, None]:
         """Emit silence sized roughly proportional to ``text``.

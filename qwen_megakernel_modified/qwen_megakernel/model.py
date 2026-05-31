@@ -246,10 +246,134 @@ class Decoder:
         self._position += 1
         return self._out_token.item()
 
+    @torch.no_grad()
+    def step_embed(self, input_embed: torch.Tensor) -> int:
+        """Single AR step taking a PRE-COMPUTED embedding instead of a token id.
+
+        The CUDA megakernel ``step(int)`` looks up the embedding internally
+        from ``codec_embedding[token_id]``. That's correct for an autoregressive
+        loop where the input is the previous output token verbatim. The
+        upstream Qwen3-TTS talker actually feeds back a SUM of 16 codebook
+        embeddings + a per-step ``trailing_text_hidden`` projection — which
+        cannot be expressed as a single int. This Python step path lets the
+        wrapper pass that combined embedding through the 28-layer talker
+        forward, writes K/V into the same megakernel cache, applies the
+        final norm + codec_head, and returns argmax. Slower than the kernel
+        (~5-15 ms/step vs ~1 ms/step) but unblocks correct text conditioning.
+
+        Args:
+            input_embed: ``(1, 1, HIDDEN)`` bf16 — the talker input embedding
+                for this AR step (typically codec_embedding sum + trailing
+                text hidden + ...).
+
+        Returns:
+            Predicted next codec token id (int).
+        """
+        if input_embed.dim() == 1:
+            input_embed = input_embed.view(1, 1, -1)
+        elif input_embed.dim() == 2:
+            input_embed = input_embed.unsqueeze(0)
+        assert input_embed.shape[-1] == HIDDEN_SIZE, (
+            f"input_embed last dim must be HIDDEN_SIZE={HIDDEN_SIZE}, got {input_embed.shape}"
+        )
+
+        device = self._k_cache.device
+        pos = self._position
+        x = input_embed.to(device=device, dtype=torch.bfloat16)
+        T = 1
+        positions = torch.tensor([pos], dtype=torch.long, device=device)
+
+        w = self._weights
+        layer_weights = w["layer_weights"]
+        n_ptrs = 11
+        for layer_idx in range(NUM_LAYERS):
+            base = layer_idx * n_ptrs
+            ln1_w = layer_weights[base + 0]
+            q_w = layer_weights[base + 1]
+            k_w = layer_weights[base + 2]
+            v_w = layer_weights[base + 3]
+            qn_w = layer_weights[base + 4]
+            kn_w = layer_weights[base + 5]
+            o_w = layer_weights[base + 6]
+            ln2_w = layer_weights[base + 7]
+            gate_w = layer_weights[base + 8]
+            up_w = layer_weights[base + 9]
+            down_w = layer_weights[base + 10]
+
+            h_norm = self._rms_norm(x, ln1_w)
+            q = F.linear(h_norm, q_w).view(1, T, 16, HEAD_DIM)
+            k = F.linear(h_norm, k_w).view(1, T, NUM_KV_HEADS, HEAD_DIM)
+            v = F.linear(h_norm, v_w).view(1, T, NUM_KV_HEADS, HEAD_DIM)
+            q = self._rms_norm(q, qn_w)
+            k = self._rms_norm(k, kn_w)
+            q = q.transpose(1, 2)  # (1, 16, T, HEAD_DIM)
+            k = k.transpose(1, 2)  # (1, KV, T, HEAD_DIM)
+            v = v.transpose(1, 2)
+
+            q, k = self._apply_rope_to_qk(q, k, positions)
+
+            # Write this step's K/V at position `pos` (single slot)
+            self._k_cache[layer_idx, :, pos:pos + 1, :].copy_(k[0].to(torch.bfloat16))
+            self._v_cache[layer_idx, :, pos:pos + 1, :].copy_(v[0].to(torch.bfloat16))
+
+            # Attention reads ALL cached K/V up to and including position pos.
+            # GQA-aware: expand kv to q heads.
+            repeat = 16 // NUM_KV_HEADS
+            past_k = self._k_cache[layer_idx, :, :pos + 1, :].unsqueeze(0)  # (1, KV, pos+1, HEAD_DIM)
+            past_v = self._v_cache[layer_idx, :, :pos + 1, :].unsqueeze(0)
+            if repeat > 1:
+                past_k = past_k.repeat_interleave(repeat, dim=1)
+                past_v = past_v.repeat_interleave(repeat, dim=1)
+
+            attn_out = F.scaled_dot_product_attention(
+                q, past_k, past_v, is_causal=False, scale=self._attn_scale
+            )
+            attn_out = attn_out.transpose(1, 2).contiguous().view(1, T, Q_SIZE)
+            attn_out = F.linear(attn_out, o_w)
+            x = x + attn_out.to(x.dtype)
+
+            h_norm2 = self._rms_norm(x, ln2_w)
+            gate = F.linear(h_norm2, gate_w)
+            up = F.linear(h_norm2, up_w)
+            inter = F.silu(gate) * up
+            mlp_out = F.linear(inter, down_w)
+            x = x + mlp_out.to(x.dtype)
+
+        # Apply final norm + codec_head to get logits, then argmax.
+        x = self._rms_norm(x, self._final_norm_weight)
+        logits = F.linear(x, self._lm_head_weight)  # (1, 1, VOCAB_SIZE=3072)
+        next_tok = int(logits.squeeze().argmax().item())
+        self._position += 1
+        return next_tok
+
     def reset(self):
         self._position = 0
         self._k_cache.zero_()
         self._v_cache.zero_()
+        # Per-utterance trailing-text scratch — see _prefill_embeds.
+        self._trailing_text_hiddens = None
+
+    @property
+    def trailing_text_hiddens(self):
+        """The (T_text - 9, HIDDEN) bf16 tensor of post-text_projection
+        embeddings, stashed during prefill_text() for the AR step's
+        text-conditioning injection. None if prefill_text wasn't called."""
+        return getattr(self, "_trailing_text_hiddens", None)
+
+    def tts_pad_embed(self) -> torch.Tensor:
+        """The codec_embedding row for ``codec_pad_id=2148``, used as the
+        per-step text-conditioning input AFTER trailing_text_hiddens is
+        exhausted. Lives in the codec_embedding table since that's the
+        upstream model's source of the pad embedding (see
+        modeling_qwen3_tts.py:2124-2132)."""
+        # Lazily built — kernel needs this on cuda + bf16 + (1, 1, HIDDEN).
+        cached = getattr(self, "_tts_pad_embed", None)
+        if cached is not None:
+            return cached
+        pad_id = torch.tensor([2148], dtype=torch.long, device=self._embed_weight.device)
+        emb = F.embedding(pad_id, self._embed_weight).view(1, 1, -1)
+        self._tts_pad_embed = emb.to(torch.bfloat16).contiguous()
+        return self._tts_pad_embed
 
     @property
     def position(self) -> int:
@@ -425,6 +549,20 @@ class Decoder:
         h = F.silu(h)
         h = F.linear(h, fc2_w, fc2_b)  # (T, HIDDEN), bf16
         h = h.to(torch.bfloat16)
+
+        # Save the post-text_projection embeddings for AR-step trailing-text
+        # injection. Upstream (modeling_qwen3_tts.py:2230-2232 + 1689-1692)
+        # adds `trailing_text_hidden[generation_step]` to each AR step's
+        # input embedding, where `trailing_text_hidden` is a slice of the
+        # input text's projected embeddings. Without this per-step text
+        # conditioning the talker drifts off-phoneme (the "speech-like
+        # babble, no EOS" symptom we observed for 137s). Stash a copy.
+        # Skip the chat-template framing tokens at the ends (~4 leading,
+        # ~5 trailing per upstream); the body carries the content tokens.
+        if h.shape[0] > 9:
+            self._trailing_text_hiddens = h[4:-5].clone().detach()
+        else:
+            self._trailing_text_hiddens = h.clone().detach()
 
         # COMBINED FORWARD — append codec_prefix embeddings (audio-side
         # input) to the same sequence as the text embeddings, so the
