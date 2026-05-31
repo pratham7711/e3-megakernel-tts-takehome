@@ -45,6 +45,13 @@ pipecat-ai[openai]>=0.0.105,<0.1.0     # optional LLM
 pipecat-ai[groq]>=0.0.105,<0.1.0       # default LLM in pipecat_demo.py
 pipecat-ai[silero]>=0.0.105,<0.1.0     # VAD
 pipecat-ai[local]>=0.0.105,<0.1.0      # LocalAudioOutputTransport
+pipecat-ai[webrtc]>=0.0.105,<0.1.0     # SmallWebRTCTransport (browser conversation mode)
+
+# FastAPI + uvicorn for the WebRTC signalling server (INPUT_MODE=webrtc).
+# These are runtime deps of pipecat-ai[webrtc] but spelled out so a slim
+# install (without the [webrtc] extra resolving cleanly) still works.
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
 
 # --- Audio I/O + arrays -----------------------------------------------------
 numpy==1.26.4         # last 1.x; 2.x not yet validated against transformers 4.57

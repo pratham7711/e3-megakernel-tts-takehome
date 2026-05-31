@@ -428,6 +428,32 @@ async def main_async(args: argparse.Namespace) -> int:
     out_path.write_text(json.dumps(_to_jsonable(results), indent=2))
     logger.info("Wrote {p}", p=out_path)
     _pretty_print(results)
+
+    # Also write the dict-shaped snapshot ui_v2 expects so the metric cards
+    # populate immediately after a bench run (not just after a Pipecat run).
+    # Schema must match pipecat_demo._write_snapshot.
+    snap_path = Path(os.environ.get("METRICS_SNAPSHOT_PATH", "/workspace/metrics_gpu.json"))
+    try:
+        snap_path.parent.mkdir(parents=True, exist_ok=True)
+        snap = {
+            "updated_at": time.time(),
+            "ttfc_ms": results.ttfc_ms.mean if (results.ttfc_ms and results.ttfc_ms.mean) else None,
+            "rtf": results.rtf.mean if (results.rtf and results.rtf.mean) else None,
+            "decode_tok_per_s": (
+                results.decode_tok_per_s.mean
+                if (results.decode_tok_per_s and results.decode_tok_per_s.mean) else None
+            ),
+            "e2e_ms": None,         # bench doesn't measure e2e; only Pipecat does
+            "first_bot_ms": None,   # same
+            "samples": int(args.timed),
+            "source": "bench_megakernel",
+        }
+        tmp = snap_path.with_suffix(snap_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(snap))
+        os.replace(tmp, snap_path)
+        logger.info("Wrote ui_v2 snapshot {p}", p=snap_path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Snapshot write failed ({e!r}); UI metric cards won't auto-populate.", e=e)
     return 0
 
 
