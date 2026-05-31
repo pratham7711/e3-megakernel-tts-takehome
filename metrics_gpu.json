@@ -1,32 +1,32 @@
 [
   {
     "kind": "user_bot_latency_s",
-    "value": 17.95481562614441
+    "value": 8.633301258087158
   },
   {
     "kind": "latency_breakdown",
-    "user_turn_secs": 0.17779040336608887,
+    "user_turn_secs": 0.17896795272827148,
     "ttfb": [
       {
         "processor": "GroqLLMService#0",
         "model": "llama-3.1-8b-instant",
-        "ms": 249.25899505615234
+        "ms": 310.81581115722656
       },
       {
         "processor": "MegakernelTTSService#0",
         "model": "",
-        "ms": 35.10928153991699
+        "ms": 14.612197875976562
       },
       {
         "processor": "MegakernelTTSService#0",
         "model": "",
-        "ms": 35.10928153991699
+        "ms": 14.612197875976562
       }
     ]
   },
   {
     "kind": "user_bot_latency_s",
-    "value": 0.2316427230834961
+    "value": 0.21782517433166504
   },
   {
     "kind": "latency_breakdown",

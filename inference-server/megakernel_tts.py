@@ -475,55 +475,41 @@ class MegakernelTTS:
         # Reset KV cache for the new utterance.
         self._talker.reset()
 
-        # Two-phase prefill matching the upstream Qwen3-TTS flow
-        # (modeling_qwen3_tts.py:1240-1295):
-        #   Phase 1 — text prefill: wrap `text` in the chat template
-        #     `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n`
-        #     with `<tts_text_bos>` / `<tts_text_eod>` framing, project through
-        #     text_embedding + text_projection MLP, write K/V at positions
-        #     [0, T_text).
-        #   Phase 2 — audio prefix prefill: feed the codec-side prefix
-        #     [codec_think, codec_think_bos, language=english, codec_think_eos,
-        #      speaker_embed(spk_id), codec_pad] through the talker's audio
-        #     input embedding (codec_embedding) and write K/V at positions
-        #     [T_text, T_text + 6).
-        # Then the FIRST AR step is seeded with codec_bos (2149) so the kernel
-        # writes codec_bos at position T_text+6 and predicts the first audio
-        # token from that state — exactly matching the upstream semantics.
+        # Single-pass combined prefill matching the upstream Qwen3-TTS flow
+        # (modeling_qwen3_tts.py:1240-1295). The text (wrapped in the
+        # `<tts_text_bos><|im_start|>assistant\n…<|im_end|>\n<|im_start|>
+        # assistant\n<tts_text_eod>` template, projected through
+        # text_embedding + text_projection MLP) is CONCATENATED with the
+        # 6-token codec-side prefix
+        #   [codec_think, codec_think_bos, language=english, codec_think_eos,
+        #    speaker_embed(spk_id), codec_pad]
+        # into a SINGLE embedding sequence. The 28-layer prefill forward
+        # then runs ONCE, so audio-prefix tokens see the text K/V within
+        # their own self-attention causal window — exactly matching the
+        # upstream `talker.generate(inputs_embeds=cat([text, codec_pref]))`
+        # semantics. The first AR step is seeded with codec_bos (2149).
         do_prefill = (
             self.config.text_prefill if text_prefill is None else bool(text_prefill)
         )
-        n_text = 0
-        n_prefix = 0
+        n_total = 0
         if do_prefill:
-            try:
-                n_text = self._talker.prefill_text(
-                    text, model_path=self.config.model_path
-                )
-                logger.debug(
-                    "MegakernelTTS: text prefill wrote {n} tokens to KV cache.",
-                    n=n_text,
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "MegakernelTTS: prefill_text() failed ({err!r}); "
-                    "proceeding without prefill (audio will be unconditioned).",
-                    err=e,
-                )
-
             try:
                 spk_id = _resolve_speaker_id(self.config.speaker)
                 prefix_ids = _audio_prefix_token_ids(spk_id, QWEN3_TTS_LANGUAGE_ENGLISH)
-                n_prefix = self._talker.prefill_codec_prefix(prefix_ids)
+                n_total = self._talker.prefill_text(
+                    text,
+                    model_path=self.config.model_path,
+                    codec_prefix_ids=prefix_ids,
+                )
                 logger.debug(
-                    "MegakernelTTS: audio prefix prefill wrote {n} tokens "
-                    "(speaker={sp} -> spk_id={sid}).",
-                    n=n_prefix, sp=self.config.speaker, sid=spk_id,
+                    "MegakernelTTS: combined prefill wrote {n} tokens to KV "
+                    "cache (text + 6 audio-prefix; speaker={sp} -> spk_id={sid}).",
+                    n=n_total, sp=self.config.speaker, sid=spk_id,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
-                    "MegakernelTTS: prefill_codec_prefix() failed ({err!r}); "
-                    "proceeding without speaker/audio-BOS conditioning.",
+                    "MegakernelTTS: combined prefill failed ({err!r}); "
+                    "proceeding without conditioning (audio will be unconditioned).",
                     err=e,
                 )
 

@@ -341,6 +341,7 @@ class Decoder:
         text: str,
         model_path: str = "/workspace/qwen3-tts-1.7b",
         add_special_tokens: bool = False,
+        codec_prefix_ids: list[int] | None = None,
     ) -> int:
         """Run pure-PyTorch text prefill, populate KV cache, advance position.
 
@@ -423,11 +424,27 @@ class Decoder:
         h = F.linear(h, fc1_w, fc1_b)
         h = F.silu(h)
         h = F.linear(h, fc2_w, fc2_b)  # (T, HIDDEN), bf16
+        h = h.to(torch.bfloat16)
 
-        # Hand the projected embeddings to the shared transformer-layer
-        # prefill helper, which writes K/V at positions [0, T) and advances
-        # ``self._position`` to T.
-        return self._prefill_embeds(h.to(torch.bfloat16))
+        # COMBINED FORWARD — append codec_prefix embeddings (audio-side
+        # input) to the same sequence as the text embeddings, so the
+        # 28-layer attention sees them within one self-attention causal
+        # window. This matches the upstream `talker.generate(inputs_embeds
+        # =cat([text_proj_out, codec_prefix_embeds]))` flow exactly. The
+        # earlier two-phase split (prefill_text then prefill_codec_prefix)
+        # left audio-prefix tokens unable to attend to text K within
+        # phase-2's attention — they could only see text via the kernel's
+        # KV cache at AR-step time, and that's apparently not enough for
+        # the model to align (talker never emitted EOS, ran 245 s).
+        if codec_prefix_ids:
+            codec_ids_t = torch.tensor(codec_prefix_ids, dtype=torch.long, device=device)
+            codec_h = F.embedding(codec_ids_t, w["embed_weight"]).to(torch.bfloat16)
+            # codec_embedding (3072, HIDDEN) — the talker's audio input
+            # embedding table, identical to what the megakernel uses for
+            # step()'s embedding lookup.
+            h = torch.cat([h, codec_h], dim=0)
+
+        return self._prefill_embeds(h)
 
     def prefill_codec_prefix(self, codec_token_ids: list[int]) -> int:
         """Prefill the audio-side prefix tokens at positions [_position, _position+N).
