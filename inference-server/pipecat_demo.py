@@ -195,13 +195,37 @@ def _build_llm() -> object:
 
         model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
         logger.info("LLM: Groq model={m}", m=model)
-        return GroqLLMService(
+        service = GroqLLMService(
             api_key=api_key,
             settings=GroqLLMService.Settings(
                 model=model,
                 system_instruction=_SYSTEM_PROMPT,
             ),
         )
+        # Warm the Groq HTTPS connection out of band so the first user turn
+        # doesn't pay TLS handshake + DNS + cold connection pool RTT. Uses
+        # the standalone groq SDK (not Pipecat) — Pipecat will set up its
+        # own httpx pool later, but the OS-level TLS session cache + DNS
+        # are now warm, shaving ~100-150 ms off the first turn's e2e.
+        try:
+            import time as _time
+            from groq import Groq
+            t0 = _time.perf_counter()
+            Groq(api_key=api_key).chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+            )
+            logger.info(
+                "Groq warmup OK in {ms:.0f} ms (DNS + TLS + cold-pool RTT paid here, not on first user turn)",
+                ms=(_time.perf_counter() - t0) * 1000.0,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Groq warmup failed ({err!r}); first user turn will pay the cold cost.",
+                err=e,
+            )
+        return service
 
     if provider == "openai":
         from pipecat.services.openai.llm import OpenAILLMService
@@ -593,16 +617,10 @@ async def run() -> None:
         sys.exit(2)
 
     # MEGAKERNEL_STUB accepts:
-    #   "0"        -> real megakernel (requires CUDA)
-    #   "1" / "silence"  -> silence frames (plumbing test, no audio)
-    #   "mac_say"  -> macOS `say` voice (real audio for Mac e2e validation)
+    #   "0" (default) -> real megakernel Qwen3-TTS — the brief's deliverable
+    #   "1"           -> silence frames (plumbing-only — does NOT meet brief)
     raw_stub = os.environ.get("MEGAKERNEL_STUB", "0").lower()
-    stub_mode = {
-        "0": None, "": None,
-        "1": "silence", "silence": "silence",
-        "mac_say": "mac_say", "macsay": "mac_say",
-    }.get(raw_stub, "silence")
-    stub = stub_mode is not None
+    stub = raw_stub in {"1", "silence"}
     speaker = os.environ.get("MEGAKERNEL_SPEAKER", "ryan")
 
     # ---- Services -------------------------------------------------------
@@ -620,7 +638,6 @@ async def run() -> None:
             speaker=speaker,
             device=os.environ.get("MEGAKERNEL_DEVICE", "cuda"),
             stub=stub,
-            stub_mode=stub_mode,
         )
     except Exception as exc:  # noqa: BLE001 - surface ALL init failures clearly
         logger.exception(
@@ -639,8 +656,8 @@ async def run() -> None:
     )
 
     logger.info(
-        "INPUT_MODE={m} stub={s} stub_mode={sm} speaker={sp}",
-        m=input_mode, s=stub, sm=stub_mode, sp=speaker,
+        "INPUT_MODE={m} stub={s} speaker={sp}",
+        m=input_mode, s=stub, sp=speaker,
     )
 
     if input_mode == "mic":

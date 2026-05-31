@@ -65,7 +65,6 @@ class MegakernelTTSService(TTSService):
         speaker: str = "ryan",
         device: str = "cuda",
         stub: bool = False,
-        stub_mode: str | None = None,
         sample_rate: int | None = None,
         **kwargs,
     ) -> None:
@@ -112,7 +111,6 @@ class MegakernelTTSService(TTSService):
             speaker=speaker,
             device=device,
             stub=stub,
-            extra={"stub_mode": stub_mode} if stub_mode else {},
         )
         self._tts = MegakernelTTS(config=config)
 

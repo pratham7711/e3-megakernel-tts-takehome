@@ -43,7 +43,7 @@ The benchmark numbers are LOCKED IN at the brief's tightest tier. Three open ite
 
 **Item 2 — Demo video**: brief requires it. Can be:
 - (a) The full Pipecat mic→GPU→speaker loop with INTELLIGIBLE audio (needs Item 1 fixed)
-- (b) The Mac-side `ui_loopback.py` Tab 2 voice loop with macOS `say` substitute — proves plumbing end-to-end, audio IS intelligible (because it's macOS speech), but it's the substitute path
+- (b) ~~Mac-side `ui_loopback.py` with macOS `say` substitute~~ — DELETED. The submission must use ONLY the megakernel Qwen3-TTS path per the brief. No fallbacks.
 - (c) Walk-through of `bench_megakernel.py` running + the metric table — pure perf demo, no voice agent at all
 
 **Item 3 — Git push + email**: HEAD `1c958e4` is local-only. Need `git push` + send `~/brain/build/side-projects/e3-submission-email-draft.md`.
@@ -75,7 +75,7 @@ Run these from `~/Documents/Repositories/e3-megakernel-tts/`.
 
 - [ ] **2. Verify in browser** — open http://localhost:8080. Click Generate with the default text. **Expect**: audio should sound DIFFERENT from the previous run (this session committed the **semantic codebook 4096 fix** — the prior runs produced garbled audio because the semantic codebook was at random init). If the new audio still sounds broken, see `~/brain/build/side-projects/e3-final-code-review-2.md` for the next 8 LOW-severity findings.
 
-- [ ] **3. Run the live Pipecat e2e** — proves the brief's Step 3 and gives us the missing 4th metric (end-to-end latency). NOTE: `pipecat_demo.py` now parses `MEGAKERNEL_STUB` as `0|silence|mac_say` and accepts `FILE_MODE_DRAIN_S` / `FILE_MODE_IDLE_TIMEOUT_S` overrides — for the real GPU run leave `MEGAKERNEL_STUB` unset (default 0 = real megakernel):
+- [ ] **3. Run the live Pipecat e2e** — proves the brief's Step 3 and gives us the missing 4th metric (end-to-end latency). `pipecat_demo.py` accepts `MEGAKERNEL_STUB` as `0` (real megakernel, the deliverable) or `1` (silence — plumbing test only). For the real GPU run leave `MEGAKERNEL_STUB` unset:
   ```bash
   ssh e3-vast 'cd /workspace/inference-server && \
     SSL_CERT_FILE="$(python3 -c "import certifi; print(certifi.where())")" \
@@ -98,7 +98,7 @@ Run these from `~/Documents/Repositories/e3-megakernel-tts/`.
    3. Read the upstream `Qwen3TTSForConditionalGeneration.generate()` from `transformers==4.57.3` (likely in `transformers.models.qwen3_tts.modeling_qwen3_tts`) and copy its prompt-building logic: chat template with `<|im_start|>system\n...<voice spec for "ryan">...<|im_end|><|im_start|>user\n{text}<|im_end|><|im_start|>assistant\n<|audio_bos|>`.
    4. In `_talker.prefill_text(text, ...)` replace the bare-text path with the chat-templated path. Pass `add_special_tokens=True`.
    5. Re-bench TTFC + RTF — should not regress since the model is the same, just conditioning is different. Bot output should now emit EOS naturally + the WAV should be ~3-5 sec of intelligible speech, not 168 sec of babble.
-   Budget estimate: ~2 h on GPU at $1.336/hr = ~$2.70. **Note this is over our $2.30 remaining headroom** — if it goes long, fall back to demo option (b) using mac_say substitute.
+   Budget estimate: ~2 h on GPU at $1.336/hr = ~$2.70. Tight — if it goes long, ship the perf benchmarks (already passing) + document the conditioning fix as in-flight.
 
 - [ ] **5. Record the demo** — script at `~/brain/build/side-projects/e3-video-recording-script.md` has the narration + test sentences. ~5 min final video. Tools: QuickTime screen recording with audio.
 
@@ -165,8 +165,8 @@ Run these from `~/Documents/Repositories/e3-megakernel-tts/`.
 | 11 | HIGH | `megakernel_tts.py:__init__` | Silent fallback to stub on Decoder / load_components failure. Hid real init errors. | Removed try/except — failures RAISE. Opt-in stub via `stub=True` only. |
 | 12 | MED | `pipecat_demo.py:PipelineTask` | Default 5-min idle timeout made file-mode smoke tests painfully slow. | `idle_timeout_secs=30` + configurable drain via `FILE_MODE_DRAIN_S`. |
 | 13 | MED | `megakernel_tts_service.py` | `TTSSettings: NOT_GIVEN model/voice/language` validator error every run. | Pass `model/voice/language` to `super().__init__()`. |
-| 14 | NEW FEATURE | `megakernel_tts.py:_mac_say_generate` | No way to demo real bot audio on Mac (only silence or GPU). | Added `MEGAKERNEL_STUB=mac_say` mode: macOS `say` → 24 kHz int16 PCM → 80 ms frame chunks matching the real codec shape. End-to-end Mac demo confirmed. |
-| 15 | HIGH (UI) | `ui_loopback.py` | Gradio 6.15.2 vs 4.x target: `editable=True` default put mic widget into WaveSurfer trim mode (no Play button); `gr.Dataframe` silently dropped `list[list[str]]` returns. | `editable=False, interactive=True` on mic; dict return for Dataframe; `autoplay=True` on every output; Clear buttons; `show_progress="full"`. Verified PASS via Playwright. |
+| 14 | REVERTED 2026-05-31 | ~~`megakernel_tts.py:_mac_say_generate`~~ | ~~Added `MEGAKERNEL_STUB=mac_say` mode~~ — removed because the brief deliverable IS the megakernel Qwen3-TTS, no fallback allowed. |
+| 15 | REVERTED 2026-05-31 | ~~`ui_loopback.py`~~ | ~~Mac-side voice loop with macOS `say` substitute~~ — file deleted for the same reason as #14. |
 
 ### Architecture decisions that paid off
 - **Scope megakernel to the talker only** (per brief) — keeping code_predictor + codec in PyTorch was the right call; let us iterate without rebuilding the kernel
@@ -188,11 +188,11 @@ Run these from `~/Documents/Repositories/e3-megakernel-tts/`.
 | Asset | Location |
 |---|---|
 | Modified megakernel | `qwen_megakernel_modified/{csrc/kernel.cu, qwen_megakernel/{build,model,bench}.py}` |
-| Inference server | `inference-server/{megakernel_tts.py, megakernel_tts_service.py, qwen3_tts_components.py, ui_v2.py, ui_loopback.py, pipecat_demo.py, bench_megakernel.py, validate_keys.py}` |
+| Inference server | `inference-server/{megakernel_tts.py, megakernel_tts_service.py, qwen3_tts_components.py, ui_v2.py, pipecat_demo.py, bench_megakernel.py, validate_keys.py}` |
 | Real-codec wrapper | `inference-server/qwen3_tts_components.py` (271 weights, clean-room) |
 | Pipecat demo (Groq + Deepgram + INPUT_MODE=mic\|file) | `inference-server/pipecat_demo.py` |
 | Gradio UI v2 | `inference-server/ui_v2.py` |
-| Mac-local loopback UI (mic + API tests, no GPU) | `inference-server/ui_loopback.py` |
+| ~~Mac-local loopback UI~~ | REMOVED — brief requires megakernel Qwen3-TTS only |
 | Bench results JSON | `bench_results.json`, `bench_megakernel_talker.json` |
 | Sample WAVs | `samples/{user_utterance, test_01_short, test_02_numerics, test_03_freight, demo_intro, bot_response}.wav` |
 | Visuals | `docs/img/{spectrum_real_codec, perf_vs_brief, ui_screenshot}.png` |

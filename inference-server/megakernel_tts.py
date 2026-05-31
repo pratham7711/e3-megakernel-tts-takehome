@@ -459,13 +459,10 @@ class MegakernelTTS:
             return
 
         if self.config.stub:
-            stub_mode = self.config.extra.get("stub_mode", "silence")
-            if stub_mode == "mac_say":
-                async for chunk in self._mac_say_generate(text):
-                    yield chunk
-            else:
-                async for chunk in self._stub_generate(text):
-                    yield chunk
+            # Silence stub is plumbing-only — does NOT meet the brief.
+            # The deliverable IS the megakernel Qwen3-TTS path below.
+            async for chunk in self._stub_generate(text):
+                yield chunk
             return
 
         if self._talker is None or self._code_predictor is None or self._codec is None:
@@ -551,84 +548,12 @@ class MegakernelTTS:
             yield pcm_bytes
 
             prev_tok = next_tok
-
-            # Cooperatively yield to the event loop so the consumer can push
-            # to its sink without head-of-line blocking the next talker step.
-            await asyncio.sleep(0)
-
-    async def _mac_say_generate(self, text: str) -> AsyncGenerator[bytes, None]:
-        """Mac-only stub: synthesize ``text`` via macOS ``say`` and stream PCM.
-
-        Lets us validate the end-to-end Pipecat pipeline on a laptop without
-        CUDA: real speech audio at 24 kHz mono int16, chunked into 80 ms
-        frames that match the codec's native frame size, so the downstream
-        BotAudioRecorder / LocalAudioOutputTransport sees frames identical
-        in shape to what the real megakernel TTS will eventually emit.
-        """
-        import subprocess
-        import tempfile
-
-        logger.warning(
-            "MegakernelTTS.generate() running in STUB mode=mac_say — using "
-            "macOS `say` as a voice substitute. Real megakernel runs on CUDA."
-        )
-
-        aiff_fd, aiff = tempfile.mkstemp(suffix=".aiff")
-        os.close(aiff_fd)
-        wav_fd, wav = tempfile.mkstemp(suffix=".wav")
-        os.close(wav_fd)
-
-        try:
-            subprocess.run(["say", "-o", aiff, text], check=True, timeout=30)
-            subprocess.run(
-                [
-                    "afconvert",
-                    "-f", "WAVE",
-                    "-d", f"LEI16@{QWEN3_TTS_SAMPLE_RATE}",
-                    "-c", "1",
-                    aiff, wav,
-                ],
-                check=True,
-                timeout=20,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.error("mac_say stub failed: {e!r}", e=e)
-            try:
-                os.unlink(aiff)
-                os.unlink(wav)
-            except OSError:
-                pass
-            return
-
-        with open(wav, "rb") as f:
-            # Strip the 44-byte WAV header so we yield raw PCM bytes (same
-            # shape downstream consumers expect from the real codec).
-            f.read(44)
-            audio_bytes = f.read()
-        try:
-            os.unlink(aiff)
-            os.unlink(wav)
-        except OSError:
-            pass
-
-        # Chunk into codec-frame-sized pieces so streaming behaviour
-        # mirrors the real path. 1920 samples * 2 bytes = 3840 bytes/frame.
-        bytes_per_frame = QWEN3_TTS_SAMPLES_PER_CODEC_FRAME * 2
-        n_frames = (len(audio_bytes) + bytes_per_frame - 1) // bytes_per_frame
-        logger.info(
-            "mac_say: {chars} chars -> {bytes} bytes -> {n} 80 ms frames",
-            chars=len(text),
-            bytes=len(audio_bytes),
-            n=n_frames,
-        )
-        for i in range(n_frames):
-            chunk = audio_bytes[i * bytes_per_frame:(i + 1) * bytes_per_frame]
-            if len(chunk) < bytes_per_frame:
-                # Pad the tail frame to full size so downstream framing
-                # assumptions hold.
-                chunk = chunk + b"\x00" * (bytes_per_frame - len(chunk))
-            yield chunk
-            await asyncio.sleep(0)
+            # NOTE: no asyncio.sleep(0) here. The `yield` above is already an
+            # async-generator yield point — control returns to the consumer
+            # without an extra reschedule. sleep(0) added 50-200 µs per frame
+            # (~3-13 ms per 5-sec utterance) with no head-of-line benefit
+            # because Pipecat drains at codec rate (~80 ms gap), far slower
+            # than our produce rate. Do NOT reintroduce.
 
     async def _stub_generate(self, text: str) -> AsyncGenerator[bytes, None]:
         """Emit silence sized roughly proportional to ``text``.

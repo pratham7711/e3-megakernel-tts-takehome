@@ -66,11 +66,24 @@ import os
 from dataclasses import dataclass
 from typing import Tuple
 
+import inspect as _inspect
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
+
+# PyTorch 2.5+ supports GQA natively in SDPA via enable_gqa=True — avoids
+# the materialized .repeat_interleave() K/V expansion. We probe the
+# function signature once at module load so the fast path lights up only
+# when the running PyTorch supports it.
+_SDPA_HAS_ENABLE_GQA = False
+try:
+    _SDPA_HAS_ENABLE_GQA = "enable_gqa" in _inspect.signature(
+        F.scaled_dot_product_attention
+    ).parameters
+except Exception:  # noqa: BLE001
+    _SDPA_HAS_ENABLE_GQA = False
 
 
 # ---------------------------------------------------------------------------
@@ -207,17 +220,21 @@ class CodePredictorAttention(nn.Module):
 
         q, k = _apply_rope(q, k, cos, sin)
 
-        # GQA: repeat kv heads to match q heads
+        # GQA: PyTorch 2.5+ fuses the K/V expansion inside SDPA via
+        # enable_gqa=True (no materialized .repeat_interleave). Older
+        # versions need the explicit expand.
         repeat = CP_NUM_Q_HEADS // CP_NUM_KV_HEADS
-        if repeat > 1:
-            k = k.repeat_interleave(repeat, dim=1)
-            v = v.repeat_interleave(repeat, dim=1)
-
-        # Use SDPA with causal mask (single-shot batched forward; if we ever
-        # add a streaming kv-cache path, swap to manual masked matmul).
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, scale=self._scale
-        )
+        if _SDPA_HAS_ENABLE_GQA and repeat > 1:
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, scale=self._scale, enable_gqa=True
+            )
+        else:
+            if repeat > 1:
+                k = k.repeat_interleave(repeat, dim=1)
+                v = v.repeat_interleave(repeat, dim=1)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, scale=self._scale
+            )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, CP_NUM_Q_HEADS * CP_HEAD_DIM)
         return self.o_proj(attn_out)
 
