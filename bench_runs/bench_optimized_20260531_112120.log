@@ -1,0 +1,46 @@
+2026-05-31 05:47:55.918 | INFO     | megakernel_tts:__init__:216 - MegakernelTTS init: model=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice path=/workspace/qwen3-tts-1.7b speaker=ryan device=cuda stub=False
+2026-05-31 05:47:58.093 | INFO     | megakernel_tts:__init__:261 - MegakernelTTS: Decoder loaded from /workspace/qwen3-tts-1.7b
+2026-05-31 05:47:59.069 | INFO     | megakernel_tts:__init__:274 - MegakernelTTS: code_predictor + codec loaded via qwen3_tts_components.load_components()
+2026-05-31 05:47:59.069 | INFO     | megakernel_tts:__init__:297 - MegakernelTTS: pre-warming compile + prefill_text (this takes ~20-25 s at model load, amortizes per-turn)…
+2026-05-31 05:48:00.171 | INFO     | megakernel_tts:_build_per_frame_fn:381 - MegakernelTTS: per-frame fn wrapped in torch.compile(mode='reduce-overhead').
+cudagraph partition due to non gpu ops. Found from : 
+   File "/workspace/inference-server/qwen3_tts_components.py", line 1027, in forward
+    pcm = pcm.to(torch.int16).cpu().numpy()
+
+cudagraph partition into 2 partitions
+2026-05-31 05:48:12.302 | INFO     | megakernel_tts:__init__:307 - MegakernelTTS: per-frame compile warmup done in 13.2 s
+The tokenizer you are loading from '/workspace/qwen3-tts-1.7b' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+2026-05-31 05:48:13.809 | INFO     | megakernel_tts:__init__:319 - MegakernelTTS: prefill_text warmup done in 1.51 s
+2026-05-31 05:48:13.809 | INFO     | __main__:bench_ttfc:246 - TTFC bench: warmup=3 timed=5
+2026-05-31 05:48:13.900 | INFO     | __main__:bench_ttfc:253 -   run 0: TTFC=21.3 ms
+2026-05-31 05:48:13.922 | INFO     | __main__:bench_ttfc:253 -   run 1: TTFC=21.3 ms
+2026-05-31 05:48:13.944 | INFO     | __main__:bench_ttfc:253 -   run 2: TTFC=21.3 ms
+2026-05-31 05:48:13.966 | INFO     | __main__:bench_ttfc:253 -   run 3: TTFC=21.4 ms
+2026-05-31 05:48:13.988 | INFO     | __main__:bench_ttfc:253 -   run 4: TTFC=21.4 ms
+2026-05-31 05:48:13.988 | INFO     | __main__:bench_rtf:310 - RTF bench: warmup=3 timed=5
+2026-05-31 05:48:15.028 | INFO     | __main__:bench_rtf:322 -   run 0: wall=258.5ms audio=5120.0ms RTF=0.0505
+2026-05-31 05:48:15.287 | INFO     | __main__:bench_rtf:322 -   run 1: wall=258.7ms audio=5120.0ms RTF=0.0505
+2026-05-31 05:48:15.546 | INFO     | __main__:bench_rtf:322 -   run 2: wall=258.6ms audio=5120.0ms RTF=0.0505
+2026-05-31 05:48:15.806 | INFO     | __main__:bench_rtf:322 -   run 3: wall=258.5ms audio=5120.0ms RTF=0.0505
+2026-05-31 05:48:16.064 | INFO     | __main__:bench_rtf:322 -   run 4: wall=258.4ms audio=5120.0ms RTF=0.0505
+2026-05-31 05:48:16.065 | INFO     | __main__:bench_decode_tok_per_s:162 - Decode tok/s bench: model=/workspace/qwen3-tts-1.7b warmup=3 timed=5 tokens=100
+2026-05-31 05:48:17.240 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 0: 0.229s -> 437.1 tok/s
+2026-05-31 05:48:17.470 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 1: 0.229s -> 437.1 tok/s
+2026-05-31 05:48:17.699 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 2: 0.229s -> 437.1 tok/s
+2026-05-31 05:48:17.928 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 3: 0.229s -> 437.0 tok/s
+2026-05-31 05:48:18.158 | INFO     | __main__:bench_decode_tok_per_s:198 -   run 4: 0.229s -> 437.0 tok/s
+2026-05-31 05:48:18.158 | INFO     | __main__:main_async:429 - Wrote bench_results.json
+================================================================
+ Megakernel Qwen3-TTS bench results
+================================================================
+ model         : Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+ speaker       : ryan
+ device        : cuda
+ sample rate   : 24000 Hz
+ stub          : False
+
+ Decode tok/s       : 437.0 +/- 0.0 tok/s  (min=437.0, max=437.1, n=5)
+ TTFC               : 21.3 +/- 0.1 ms  (min=21.3, max=21.4, n=5)
+ RTF                : 0.0505 +/- 0.0000   (min=0.0505, max=0.0505, n=5)
+
+================================================================

@@ -1,0 +1,49 @@
+2026-05-31 05:48:19.816 | INFO     | pipecat:<module>:14 - ᓚᘏᗢ Pipecat 1.3.0 (Python 3.12.3 (main, Nov  6 2025, 13:44:16) [GCC 13.3.0]) ᓚᘏᗢ
+2026-05-31 05:48:21.409 | INFO     | __main__:_build_llm:197 - LLM: Groq model=llama-3.1-8b-instant
+2026-05-31 05:48:21.555 | INFO     | __main__:_build_llm:219 - Groq warmup OK in 115 ms (DNS + TLS + cold-pool RTT paid here, not on first user turn)
+2026-05-31 05:48:21.555 | INFO     | megakernel_tts:__init__:216 - MegakernelTTS init: model=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice path=/workspace/qwen3-tts-1.7b speaker=ryan device=cuda stub=False
+2026-05-31 05:48:22.797 | INFO     | megakernel_tts:__init__:261 - MegakernelTTS: Decoder loaded from /workspace/qwen3-tts-1.7b
+2026-05-31 05:48:23.664 | INFO     | megakernel_tts:__init__:274 - MegakernelTTS: code_predictor + codec loaded via qwen3_tts_components.load_components()
+2026-05-31 05:48:23.664 | INFO     | megakernel_tts:__init__:297 - MegakernelTTS: pre-warming compile + prefill_text (this takes ~20-25 s at model load, amortizes per-turn)…
+2026-05-31 05:48:24.410 | INFO     | megakernel_tts:_build_per_frame_fn:381 - MegakernelTTS: per-frame fn wrapped in torch.compile(mode='reduce-overhead').
+cudagraph partition due to non gpu ops. Found from : 
+   File "/workspace/inference-server/qwen3_tts_components.py", line 1027, in forward
+    pcm = pcm.to(torch.int16).cpu().numpy()
+
+cudagraph partition into 2 partitions
+2026-05-31 05:48:33.709 | INFO     | megakernel_tts:__init__:307 - MegakernelTTS: per-frame compile warmup done in 10.0 s
+The tokenizer you are loading from '/workspace/qwen3-tts-1.7b' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+2026-05-31 05:48:34.315 | INFO     | megakernel_tts:__init__:319 - MegakernelTTS: prefill_text warmup done in 0.61 s
+2026-05-31 05:48:34.315 | INFO     | megakernel_tts_service:__init__:123 - MegakernelTTSService ready: model=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice speaker=ryan device=cuda source_rate=24000 stub=False
+2026-05-31 05:48:34.387 | INFO     | __main__:run:658 - INPUT_MODE=file stub=False speaker=ryan
+/workspace/inference-server/pipecat_demo.py:574: DeprecationWarning: PipelineTask is deprecated, use PipelineWorker instead.
+  task = PipelineTask(
+/workspace/inference-server/pipecat_demo.py:591: DeprecationWarning: PipelineRunner is deprecated, use WorkerRunner instead.
+  runner = PipelineRunner()
+/workspace/inference-server/pipecat_demo.py:593: DeprecationWarning: Passing a worker to WorkerRunner.run() is deprecated; register it with WorkerRunner.add_workers() before calling run() instead.
+  await runner.run(task)
+2026-05-31 05:48:34.388 | INFO     | __main__:_pump:319 - WavFileInputProcessor: pumping /workspace/samples/user_utterance.wav (16000 Hz, 1 ch, 40624 frames, 20 ms chunks)
+2026-05-31 05:48:34.400 | ERROR    | pipecat.services.settings:validate_complete:336 - TTSSettings: the following fields are NOT_GIVEN: model, voice, language. All settings fields should be initialized in the service's __init__ (use None for unsupported fields).
+2026-05-31 05:48:37.092 | INFO     | __main__:_pump:366 - WavFileInputProcessor: input exhausted, draining for 12.0s
+2026-05-31 05:48:37.149 | WARNING  | pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy:_handle_vad_user_stopped_speaking:178 - TurnAnalyzerUserTurnStopStrategy#0: VAD stop_secs (0.0s) differs from the recommended default (0.2s). Built-in p99 latency values assume stop_secs=0.2. Re-run https://github.com/pipecat-ai/stt-benchmark with your settings and pass the TTFS P99 latency result as ttfs_p99_latency to your STT service.
+2026-05-31 05:48:37.573 | INFO     | megakernel_tts_service:run_tts:169 - MegakernelTTSService TTFC=35.1 ms (context=c515229d-5cb4-4dd1-9332-e27849bbcd9e)
+2026-05-31 05:48:55.031 | WARNING  | pipecat.audio.vad.vad_controller:_audio_idle_handler:210 - VADController#0: no audio received while speaking, forcing speech stop
+2026-05-31 05:48:55.063 | INFO     | __main__:_on_latency:406 - [E2E] UserStoppedSpeaking → BotStartedSpeaking: 17955 ms
+2026-05-31 05:48:55.063 | INFO     | __main__:_on_breakdown:423 - [E2E] per-service TTFB: GroqLLMService#0 (llama-3.1-8b-instant) = 249 ms
+2026-05-31 05:48:55.063 | INFO     | __main__:_on_breakdown:423 - [E2E] per-service TTFB: MegakernelTTSService#0 = 35 ms
+2026-05-31 05:48:55.063 | INFO     | __main__:_on_breakdown:423 - [E2E] per-service TTFB: MegakernelTTSService#0 = 35 ms
+2026-05-31 05:48:55.096 | INFO     | __main__:_on_latency:406 - [E2E] UserStoppedSpeaking → BotStartedSpeaking: 232 ms
+2026-05-31 05:48:55.118 | WARNING  | pipecat.services.deepgram.stt:_on_error:672 - DeepgramSTTService#0 connection error, will retry: received 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001; then sent 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001
+2026-05-31 05:48:55.118 | ERROR    | pipecat.processors.frame_processor:push_error_frame:699 - DeepgramSTTService#0 error: received 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001; then sent 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001
+2026-05-31 05:48:55.118 | WARNING  | pipecat.pipeline.worker:_source_push_frame:1116 - PipelineTask#0: Something went wrong: ErrorFrame#0(error: received 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001; then sent 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001, fatal: False)
+2026-05-31 05:48:55.118 | WARNING  | pipecat.services.deepgram.stt:_keepalive_handler:665 - DeepgramSTTService#0: Keepalive failed: received 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001; then sent 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001
+2026-05-31 05:48:55.125 | ERROR    | pipecat.processors.frame_processor:push_error_frame:699 - DeepgramSTTService#0 exception (/usr/local/lib/python3.12/dist-packages/websockets/legacy/protocol.py:925): Error processing frame: received 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001; then sent 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001
+2026-05-31 05:48:55.125 | WARNING  | pipecat.pipeline.worker:_source_push_frame:1116 - PipelineTask#0: Something went wrong: ErrorFrame#1(error: Error processing frame: received 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001; then sent 1011 (internal error) Deepgram did not receive audio data or a text message within the timeout window. See https://dpgr.am/net0001, fatal: False)
+2026-05-31 05:48:56.246 | WARNING  | pipecat.utils.asyncio.task_manager:cancel_task:198 - DeepgramSTTService#0::_connection_handler: timed out waiting for task to cancel
+2026-05-31 05:49:22.088 | WARNING  | pipecat.pipeline.worker:_idle_timeout_detected:1216 - Idle timeout detected.
+2026-05-31 05:49:22.088 | WARNING  | pipecat.pipeline.worker:_idle_timeout_detected:1221 - Idle pipeline detected, cancelling pipeline worker...
+2026-05-31 05:49:22.088 | WARNING  | pipecat.pipeline.worker:_idle_timeout_detected:1224 - ...and cancelling the runner.
+2026-05-31 05:49:25.096 | WARNING  | pipecat.utils.asyncio.task_manager:cancel_task:198 - MegakernelTTSService#0::__input_frame_task_handler: timed out waiting for task to cancel
+2026-05-31 05:49:25.097 | INFO     | __main__:_dump_metrics:452 - [E2E SUMMARY] user-bot latency n=2 mean=9093 ms min=232 ms max=17955 ms
+2026-05-31 05:49:25.098 | INFO     | __main__:_dump_metrics:464 - [E2E] wrote 4 metric events to /workspace/metrics_gpu.json
+2026-05-31 05:49:25.108 | INFO     | __main__:_save_wav:475 - Wrote 11784960 bytes of 24000 Hz audio to /workspace/samples/bot_response_gpu.wav
