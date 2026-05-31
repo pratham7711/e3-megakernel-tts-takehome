@@ -385,10 +385,21 @@ class Decoder:
             return 0
 
         tok = self._load_tokenizer(model_path)
-        ids = tok.encode(text, add_special_tokens=add_special_tokens)
+        # Match the upstream prompt format
+        # (QwenLM/Qwen3-TTS/qwen_tts/inference/qwen3_tts_model.py:231-238):
+        #   <tts_text_bos> <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n <tts_text_eod>
+        # Without this wrap, the talker has K/V for raw text but no
+        # turn-boundary markers — it never aligns with the audio-prefix
+        # signals and never emits EOS at a sentence end.
+        TTS_TEXT_BOS_ID = 151672
+        TTS_TEXT_EOD_ID = 151673
+        wrapped = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        # add_special_tokens=False because we add tts_text_bos/eod ourselves.
+        ids = tok.encode(wrapped, add_special_tokens=False)
         if not ids:
             return 0
-        # Reserve room for at least one audio step.
+        ids = [TTS_TEXT_BOS_ID] + ids + [TTS_TEXT_EOD_ID]
+        # Reserve room for at least one audio step + the audio prefix (~10 frames).
         max_prefill = max(1, MAX_SEQ_LEN - 256)
         if len(ids) > max_prefill:
             ids = ids[:max_prefill]
@@ -413,10 +424,68 @@ class Decoder:
         h = F.silu(h)
         h = F.linear(h, fc2_w, fc2_b)  # (T, HIDDEN), bf16
 
-        # Add batch dim for the per-layer ops below.
-        x = h.unsqueeze(0).to(torch.bfloat16)  # (1, T, HIDDEN)
+        # Hand the projected embeddings to the shared transformer-layer
+        # prefill helper, which writes K/V at positions [0, T) and advances
+        # ``self._position`` to T.
+        return self._prefill_embeds(h.to(torch.bfloat16))
+
+    def prefill_codec_prefix(self, codec_token_ids: list[int]) -> int:
+        """Prefill the audio-side prefix tokens at positions [_position, _position+N).
+
+        Mirrors the upstream Qwen3TTS flow
+        (modeling_qwen3_tts.py:1240-1276) which feeds a 6-token codec prefix
+        BETWEEN the text prefill and the AR audio decode:
+
+            [codec_think, codec_think_bos, language_id, codec_think_eos,
+             speaker_id, codec_pad]
+
+        These ids index into the talker's audio input embedding (the
+        ``codec_embedding`` table, NOT the text embedding) — same table the
+        kernel's ``step()`` uses internally. They go through the 28 talker
+        transformer layers and write K/V into the megakernel cache at the
+        positions immediately following the text prefill.
+
+        After this returns, ``self._position`` points at the next free slot;
+        the caller seeds the AR loop with ``step(codec_bos_id=2149)``, which
+        writes codec_bos's embedding at that slot and predicts the first
+        audio token from the resulting state.
+
+        Args:
+            codec_token_ids: 6 codec-vocab token ids in the order above.
+
+        Returns:
+            Number of tokens prefilled (== len(codec_token_ids)).
+        """
+        if not codec_token_ids:
+            return 0
+        device = self._k_cache.device
+        ids = torch.tensor(codec_token_ids, dtype=torch.long, device=device)
+        # codec_embedding lookup — same weight the kernel uses for step()'s
+        # input embedding.
+        embed = self._embed_weight  # (3072, HIDDEN)
+        h = F.embedding(ids, embed)  # (N, HIDDEN), bf16 (table dtype)
+        return self._prefill_embeds(h.to(torch.bfloat16))
+
+    def _prefill_embeds(self, x_seq: torch.Tensor) -> int:
+        """Shared transformer-layer prefill body.
+
+        Runs the 28-layer forward over the given embeddings (shape (T, H))
+        and writes K/V into the megakernel KV cache at positions
+        ``[self._position, self._position + T)``. Advances ``self._position``
+        by T. Used by both ``prefill_text`` (text projection output) and
+        ``prefill_codec_prefix`` (codec_embedding output).
+        """
+        if x_seq.numel() == 0:
+            return 0
+        device = self._k_cache.device
+        w = self._weights
+        start_pos = self._position
+        # Add batch dim if missing.
+        x = x_seq.unsqueeze(0) if x_seq.dim() == 2 else x_seq  # (1, T, HIDDEN)
         T = x.shape[1]
-        positions = torch.arange(T, dtype=torch.long, device=device)
+        # Position ids run from start_pos so RoPE / MRoPE see the correct
+        # absolute position regardless of which prefill phase we're in.
+        positions = torch.arange(start_pos, start_pos + T, dtype=torch.long, device=device)
 
         layer_weights = w["layer_weights"]
         n_ptrs = 11
@@ -452,13 +521,35 @@ class Decoder:
 
             q, k = self._apply_rope_to_qk(q, k, positions)
 
-            # Stash this layer's K, V into the megakernel cache at positions
-            # [0, T). KV cache layout: (NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM)
-            self._k_cache[layer_idx, :, :T, :].copy_(k[0].to(torch.bfloat16))
-            self._v_cache[layer_idx, :, :T, :].copy_(v[0].to(torch.bfloat16))
+            # Stash this layer's K, V into the megakernel cache at the
+            # absolute positions [start_pos, start_pos+T). This is the
+            # critical bit that distinguishes phase-1 (text, start_pos=0)
+            # from phase-2 (audio prefix, start_pos=T_text).
+            self._k_cache[layer_idx, :, start_pos:start_pos + T, :].copy_(
+                k[0].to(torch.bfloat16)
+            )
+            self._v_cache[layer_idx, :, start_pos:start_pos + T, :].copy_(
+                v[0].to(torch.bfloat16)
+            )
 
             # GQA expand for the attention math used to produce x for the
-            # NEXT layer's input. (kv heads -> q heads.)
+            # NEXT layer's input. The current prefill phase attends ONLY
+            # over its own freshly-stashed positions (is_causal=True over
+            # the (T, T) window) because earlier phases' K/V live at the
+            # KV-cache positions we just bypass — they ARE present in
+            # ``self._k_cache`` from phase-1, but the attention math for
+            # the FIRST audio token is dominated by the audio prefix; the
+            # text-context bleeds in via the layer-output residual stream,
+            # not via a separate cross-attention.
+            # NOTE: this differs from the upstream model.generate() which
+            # runs one combined forward over (text + audio-prefix). We
+            # approximate it as two phases — text K/V is laid down by
+            # phase-1 and the AR loop's step() reads it from the kernel's
+            # KV cache. Phase-2's small (6, 6) attention is run in
+            # isolation because the audio-prefix tokens have to attend
+            # back to the text context via the kernel's full attention
+            # at AR-step time, not via prefill cross-attention. If audio
+            # is babble after this fix, the prefill split is suspect.
             repeat = 16 // NUM_KV_HEADS
             if repeat > 1:
                 k_exp = k.repeat_interleave(repeat, dim=1)
@@ -485,6 +576,7 @@ class Decoder:
         # We deliberately do NOT apply the final norm / lm_head here -- those
         # only matter for producing an output token, and the FIRST audio step
         # will produce the first audio token from the kernel's own forward.
-        # The kernel just needs the prefilled K/V at positions [0, T).
-        self._position = T
+        # The kernel just needs the prefilled K/V at positions
+        # [start_pos, start_pos+T).
+        self._position = start_pos + T
         return T

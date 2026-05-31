@@ -49,8 +49,59 @@ QWEN3_TTS_SAMPLES_PER_CODEC_FRAME: int = int(
 # from the talker, not by a fixed token count.
 QWEN3_TTS_TALKER_RATE_HZ: float = 13.0
 
-# Qwen3-TTS codec EOS token id (per Qwen3-TTS-12Hz-1.7B-CustomVoice config).
-QWEN3_TTS_CODEC_EOS_TOKEN_ID: int = 2150
+# Qwen3-TTS audio-side codec token ids (verified against the upstream
+# Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice config.json + the QwenLM/Qwen3-TTS
+# inference reference at qwen_tts/core/models/modeling_qwen3_tts.py:1240-1295).
+# These IDs live in the audio vocab (size 3072), NOT the text vocab.
+QWEN3_TTS_CODEC_PAD_TOKEN_ID: int = 2148      # codec_pad_id
+QWEN3_TTS_CODEC_BOS_TOKEN_ID: int = 2149      # codec_bos_id  — the "begin generating audio" sentinel
+QWEN3_TTS_CODEC_EOS_TOKEN_ID: int = 2150      # codec_eos_token_id
+QWEN3_TTS_CODEC_THINK_ID: int = 2154          # codec_think_id
+QWEN3_TTS_CODEC_THINK_BOS_ID: int = 2156      # codec_think_bos_id
+QWEN3_TTS_CODEC_THINK_EOS_ID: int = 2157      # codec_think_eos_id
+QWEN3_TTS_LANGUAGE_ENGLISH: int = 2050        # codec_language_id["english"]
+
+# Speaker id map — talker_config.spk_id from upstream config.json (range
+# 2861-3066 in the audio vocab). Reading at __init__ time from the on-disk
+# config would be more robust; we hard-code here for the canonical 9 voices.
+QWEN3_TTS_SPEAKER_IDS: dict[str, int] = {
+    "serena":   2861,
+    "vivian":   2862,
+    "uncle_fu": 2863,
+    "ryan":     3061,
+    "aiden":    3062,
+    "ono_anna": 3063,
+    "sohee":    3064,
+    "eric":     3065,
+    "dylan":    3066,
+}
+
+# Audio-side prefix that the upstream model injects between the text prefill
+# and the AR audio decode. ORDER MATTERS — derived from
+# modeling_qwen3_tts.py:1240-1276. We prefill the first 6 of these and let
+# the AR loop's FIRST step() seed codec_bos itself (so the kernel's
+# step(prev_tok=2149) writes codec_bos at the right position and predicts
+# the first audio token from that state, matching upstream semantics).
+def _audio_prefix_token_ids(spk_id: int, language_id: int = QWEN3_TTS_LANGUAGE_ENGLISH) -> list[int]:
+    return [
+        QWEN3_TTS_CODEC_THINK_ID,        # 2154
+        QWEN3_TTS_CODEC_THINK_BOS_ID,    # 2156
+        language_id,                      # 2050 for English
+        QWEN3_TTS_CODEC_THINK_EOS_ID,    # 2157
+        spk_id,                           # e.g. 3061 for ryan
+        QWEN3_TTS_CODEC_PAD_TOKEN_ID,    # 2148
+        # NOTE: codec_bos (2149) is fed via the FIRST step() call, not here
+    ]
+
+
+def _resolve_speaker_id(speaker: str) -> int:
+    """Resolve a speaker name (e.g. 'ryan') to its codec token id."""
+    key = speaker.lower().strip()
+    if key not in QWEN3_TTS_SPEAKER_IDS:
+        raise ValueError(
+            f"Unknown speaker {speaker!r}. Valid speakers: {sorted(QWEN3_TTS_SPEAKER_IDS)}"
+        )
+    return QWEN3_TTS_SPEAKER_IDS[key]
 
 
 @dataclass
@@ -427,21 +478,34 @@ class MegakernelTTS:
         # Reset KV cache for the new utterance.
         self._talker.reset()
 
-        # Run text prefill so the audio is intelligibly conditioned on the
-        # input string. The Decoder.prefill_text() method does this in pure
-        # PyTorch using the same weight tensors the kernel uses, and writes
-        # K/V directly into the megakernel's KV cache buffers. After this
-        # call, self._talker._position is set to the prefill length and the
-        # following step() calls continue autoregressively.
+        # Two-phase prefill matching the upstream Qwen3-TTS flow
+        # (modeling_qwen3_tts.py:1240-1295):
+        #   Phase 1 — text prefill: wrap `text` in the chat template
+        #     `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n`
+        #     with `<tts_text_bos>` / `<tts_text_eod>` framing, project through
+        #     text_embedding + text_projection MLP, write K/V at positions
+        #     [0, T_text).
+        #   Phase 2 — audio prefix prefill: feed the codec-side prefix
+        #     [codec_think, codec_think_bos, language=english, codec_think_eos,
+        #      speaker_embed(spk_id), codec_pad] through the talker's audio
+        #     input embedding (codec_embedding) and write K/V at positions
+        #     [T_text, T_text + 6).
+        # Then the FIRST AR step is seeded with codec_bos (2149) so the kernel
+        # writes codec_bos at position T_text+6 and predicts the first audio
+        # token from that state — exactly matching the upstream semantics.
         do_prefill = (
             self.config.text_prefill if text_prefill is None else bool(text_prefill)
         )
+        n_text = 0
+        n_prefix = 0
         if do_prefill:
             try:
-                n = self._talker.prefill_text(text, model_path=self.config.model_path)
+                n_text = self._talker.prefill_text(
+                    text, model_path=self.config.model_path
+                )
                 logger.debug(
                     "MegakernelTTS: text prefill wrote {n} tokens to KV cache.",
-                    n=n,
+                    n=n_text,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
@@ -450,11 +514,26 @@ class MegakernelTTS:
                     err=e,
                 )
 
-        # Seed the first audio decode step. With prefill the talker has
-        # already absorbed the text context, so token 0 is just the
-        # "begin audio" sentinel; without prefill we fall back to the
-        # pre-prefill behaviour (unconditioned audio).
-        prev_tok: int = 0
+            try:
+                spk_id = _resolve_speaker_id(self.config.speaker)
+                prefix_ids = _audio_prefix_token_ids(spk_id, QWEN3_TTS_LANGUAGE_ENGLISH)
+                n_prefix = self._talker.prefill_codec_prefix(prefix_ids)
+                logger.debug(
+                    "MegakernelTTS: audio prefix prefill wrote {n} tokens "
+                    "(speaker={sp} -> spk_id={sid}).",
+                    n=n_prefix, sp=self.config.speaker, sid=spk_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "MegakernelTTS: prefill_codec_prefix() failed ({err!r}); "
+                    "proceeding without speaker/audio-BOS conditioning.",
+                    err=e,
+                )
+
+        # First AR step seeds codec_bos (2149) — the upstream "begin generating
+        # audio" sentinel. The kernel writes its embedding at the next position
+        # and predicts the first audio token from that state.
+        prev_tok: int = QWEN3_TTS_CODEC_BOS_TOKEN_ID if do_prefill else 0
 
         max_new = self.config.max_new_tokens
         eos = self.config.eos_token_id
