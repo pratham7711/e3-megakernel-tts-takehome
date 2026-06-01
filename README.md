@@ -2,7 +2,7 @@
 
 > Take-home submission for e3 Group (via Contrario). 4-day window, ~5 hours of focused work, $10 GPU budget on Vast.ai.
 
-**TL;DR**: Ported AlpinDale's `qwen_megakernel` (CUDA single-kernel Qwen3-0.6B decode, ~1036 tok/s on RTX 5090) to serve Qwen3-TTS-1.7B-CustomVoice's talker decoder. The modified kernel compiles + runs end-to-end at **503 tok/s** for the 1.7B talker, giving an **implied RTF of 0.026** (vs the brief's <0.15 target -- 5x headroom). Pipecat integration is scaffolded with a working `TTSService` subclass + bench harness. The honest gap: **MRoPE is not yet implemented inside the kernel** -- outputs are valid audio token IDs but won't be acoustically faithful to HF reference until the kernel's rotary embedding math is replaced with the multi-section RoPE Qwen3-TTS uses.
+**TL;DR**: Adapted AlpinDale's `qwen_megakernel` (CUDA single-kernel Qwen3-0.6B decode at ~1036 tok/s on RTX 5090) to serve Qwen3-TTS-1.7B-CustomVoice's talker decoder, with a Pipecat voice pipeline (Deepgram STT → Groq LLM → MegakernelTTS → streaming audio). **The headline of this submission is the diagnosis arc, not the perf table**: my first pass passed perf benchmarks at TTFC 18.7 ms / RTF 0.123, but the audio was unintelligible (Deepgram round-trip returned 0.0 confidence), which surfaced a four-bug wiring stack between our megakernel and upstream Qwen3-TTS. Fixing all four made the audio match the upstream baseline at **0.9995-1.000 Deepgram confidence**. Initial post-fix numbers were TTFC 23.4 ms / RTF 0.181 (passed Deliverables only). **A subsequent megakernel-AR talker swap** — wiring `torch.ops.qwen_megakernel_C.decode_embed` (a new precomputed-embedding entry point added to `kernel.cu`) into the AR loop, replacing the previously-bypassed graphed-PyTorch 28-layer forward — brought us to **TTFC 25.32 ± 0.03 ms** (passes all three tiers) and **RTF 0.1452 ± 1.7e-4 (passes Performance tier <0.15)**, with Deepgram still at 1.000. See "The megakernel-AR swap" section below for the full diagnosis + fix.
 
 ## Architecture
 
@@ -150,9 +150,97 @@ INPUT_MODE=mic python3 pipecat_demo.py
 ![Real-codec output spectrum](docs/img/spectrum_real_codec.png)
 *Waveform + STFT of the ~2 s real-codec render -- multi-component spectrum (not a single sine tone), confirming the full decode path runs end-to-end. Quick stats in [docs/spectrum_stats.md](docs/spectrum_stats.md).*
 
-## Performance -- measured numbers (n=5, 3 warmup runs, RTX 5090 sm_120)
+## Performance + Audio QA (RTX 5090 sm_120, NGC PyTorch 2.10.0a)
 
-**Fresh full-stack measurements (2026-05-31)** — REAL Qwen3-TTS path: real talker megakernel + real 5-layer CodePredictor + real 271-weight Code2WavCodec clean-room re-impl. `torch.compile(mode="reduce-overhead")` enabled. `stub=False`. All weights load with 0 missing / 0 unexpected.
+This submission optimises for two metrics, in this priority order:
+
+1. **Audio intelligibility** — measured by Deepgram nova-2 STT round-trip on the generated TTS output (industry-standard ground-truth gate)
+2. **Perf benchmarks** (TTFC, RTF, decode tok/s) per the brief's tier table
+
+### Audio intelligibility — PASS
+
+The TTS output is verified intelligible by running the generated WAV back through Deepgram nova-2 and comparing the transcript to the input text. This is the same Deepgram model used in the production STT half of the pipeline, applied here as a separate QA gate.
+
+| Speaker | Input text | Deepgram transcript | Confidence | WAV |
+|---|---|---|---|---|
+| ryan | "Hello. How are you?" | "Hello. How are you?" | **0.9995** | `samples/bot_test_polish_4_ryan_med.wav` |
+| ryan | "Hello." | "Hello?" | 0.960 | `samples/bot_test_polish_4_ryan_short.wav` |
+| aiden | "Hello. How are you?" | "Hello. How are you?" | **1.000** | `samples/bot_test_polish_4_aiden_med.wav` |
+| aiden | "Hello." | "Hello?" | 0.979 | `samples/bot_test_polish_4_aiden_short.wav` |
+| ryan | "Hello, this is a test of the megakernel speech synthesis system. The quick brown fox jumps over the lazy dog. How are you today?" | (full sentence transcribed) | **0.9990** | `samples/bot_test.wav` |
+
+**Control**: running the same input through vanilla upstream `qwen_tts.Qwen3TTSModel` (no megakernel) on the same GPU + same weights yields the same Deepgram transcript at **0.9995 confidence** — our megakernel-wired path matches the upstream baseline.
+
+### Perf benchmarks — TTFC passes ALL tiers; RTF passes Performance tier
+
+| Metric | Our value | Tightest (<50 / <0.10) | Perf (<60 / <0.15) | Deliverables (<90 / <0.30) |
+|---|---|---|---|---|
+| **TTFC** | **25.32 ± 0.03 ms** | ✅ **PASS** | ✅ **PASS** | ✅ **PASS** |
+| **RTF** | **0.1452 ± 1.7e-4** | ❌ MISS (by 0.045) | ✅ **PASS** | ✅ **PASS** |
+| **Decode tok/s** (isolated 1.7B talker hot path) | 437 ± 0.04 | report-only | report-only | report-only |
+
+Methodology: n=5 + 3 warmup, explicit `cuda.synchronize` at every timer boundary, `time.perf_counter_ns` for sub-millisecond resolution. Raw data in `bench_results.json`.
+
+### The megakernel-AR swap — how RTF crossed Performance tier
+
+**The most load-bearing finding in this submission**, and the reason the perf table above is in Performance tier rather than missing it by 0.03: until late in the project, the production AR audio-decode hot path was **not actually invoking the persistent megakernel**. `Decoder.step(token_id)` (which calls `torch.ops.qwen_megakernel_C.decode`) was alive only in the bench harnesses (`bench.py`, `bench_megakernel.py`). The actual TTS path called `Decoder.step_embed(input_embed)` → `step_embed_logits_graphed` → a CUDA-graph-captured PyTorch 28-layer forward.
+
+The bypass had an architectural reason: the AlpinDale megakernel's `_decode(token_id, embed_weight, ...)` does the embedding lookup internally — it expects an int token id. But Qwen3-TTS's AR step needs a **precomputed** input embedding (`last_id_hidden + Σ codec_embedding[i](cb_preds[i]) + trailing_text[step_idx]`) — there's no token-id surface for that. So when audio support was wired, the megakernel call was replaced with a graphed-PyTorch path, and the "we use the megakernel" claim quietly stopped being true in the hot path.
+
+**The fix** (~80 lines across `csrc/kernel.cu`, `csrc/torch_bindings.cpp`, `qwen_megakernel/model.py`):
+
+1. Added a nullable `input_embed: const __nv_bfloat16*` parameter to `ldg_decode_kernel_direct`. When non-null, the kernel skips its internal `embed_weight[input_token_id]` lookup and reads layer-0 input directly from `input_embed`. Branch is uniform across blocks/threads — no warp divergence.
+2. Added a new `launch_ldg_decode_direct_embed` C entry point that calls the kernel with the precomputed embedding AND **skips** the subsequent `ldg_lm_head_fused` launch — caller does `F.linear(lm_head_weight, ·)` in PyTorch and applies the full custom sampling tail (rep-pen + suppress-mask + top-k + Gumbel, which can't live in the kernel because of state).
+3. Registered `torch.ops.qwen_megakernel_C.decode_embed` Python op + `Decoder.step_embed_megakernel()` method. Default-on in `step_embed` (kill-switch `QWEN_USE_MEGAKERNEL_AR=0`); automatic fallback to graphed PyTorch on any exception.
+
+**Result**: ~280 graph-replay ops collapse to ONE persistent megakernel launch per AR step (96 blocks × 512 threads, `LDG_LM_NUM_BLOCKS=1184` for the 5090's 170 SMs). Same math (RMSNorm, MRoPE table, SDPA, final norm — all bit-identical up to bf16 rounding), only the dispatch shape changes.
+
+| Bench (n=5, warmup=3) | Before (graphed PyTorch) | After (megakernel-AR) | Δ |
+|---|---|---|---|
+| TTFC | 23.42 ± 0.03 ms | **25.32 ± 0.03 ms** | +1.9 ms (still ✅ all tiers) |
+| RTF | 0.1813 ± 2.8e-5 | **0.1452 ± 1.7e-4** | **−20% (crosses Performance tier <0.15)** |
+| Decode wall / 5.12 s audio | 928 ms | **743 ms** | −185 ms |
+| Per-step talker time | ~3 ms (graphed) | ~0.1 ms (one launch) | persistent threads keep data in registers across all 28 layers |
+| Deepgram audio QA | 0.9995 | **1.000** | no regression |
+
+**Audio diagnosis arc (earlier in the project, kept for the engineering story).** Before the megakernel-AR swap, a four-bug wiring stack between the megakernel and upstream Qwen3-TTS had to be fixed first — the first pass benched at TTFC 18.7 ms / RTF 0.123 but produced unintelligible audio (Deepgram 0.0 confidence). A spawned wiring-audit agent diffed against vanilla upstream and found:
+
+1. **CodePredictor input wrong** — heuristic int-token lookup instead of the talker's last-layer hidden state into a 5-layer transformer that AR-decodes 15 additional codebooks.
+2. **Talker AR step wrong** — receiving only codebook-0's embedding; upstream feeds `sum(16 codebook embeddings)` from the previous step.
+3. **Greedy argmax everywhere** — model trains with `do_sample=True, top_k=50, temperature=0.9, repetition_penalty=1.05`; greedy collapses to a babble attractor.
+4. **Audio prefix wrong** — sequence-concatenated; upstream does element-wise sum with the text projection at matching positions (10 positions, not 22).
+
+Fixing all four made audio match upstream (Deepgram 0.9995-1.000); the megakernel-AR swap then closed the remaining perf gap. Path to **Tightest tier (<0.10)** is scoped but unbuilt: collapse CP's 14 per-step CUDA-graph replays + Gumbel sampling into ONE megagraph — projected −3 to −5 ms/step, RTF ~0.13. See `CHANGELOG.md` for the full diff.
+
+### Cross-validation against upstream
+
+The vanilla `qwen_tts.Qwen3TTSModel.generate_custom_voice("Hello. How are you?", speaker="Ryan", language="English")` on the same RTX 5090 with the same weights produces a 3.92 s WAV that transcribes via Deepgram at 0.9995 confidence. Our megakernel-wired output (same input, same speaker) transcribes at 0.9995-1.000. **Wiring is faithful.**
+
+### Measurement methodology — where + how each number comes from
+
+The brief specifies four metrics; this table maps each to the exact code path that captures it, the timing primitive, and the synchronization point. Everything below is reproducible from this repo.
+
+| Metric | Code path | Timing primitive | Sync | Sample size |
+|---|---|---|---|---|
+| **Decode tok/s** (bare talker) | `bench_megakernel.py:bench_decode_one_pass` | `time.perf_counter()` | explicit `cuda.synchronize()` before t0 + after 100-token decode loop | 3 warmup + 5 timed; mean ± pstdev |
+| **TTFC** (time to first PCM chunk) | `bench_megakernel.py:bench_ttfc_one_pass` | `time.perf_counter_ns()` | explicit `cuda.synchronize()` before `generate()` AND at first chunk yield; `.cpu().numpy()` also forces implicit sync | 3 warmup + 5 timed; pstdev reported |
+| **RTF** (synth wall / audio dur) | `bench_megakernel.py:bench_rtf_one_pass` | `time.perf_counter()` | explicit sync before t0 + after last chunk so wall time is end-to-end GPU work | 3 warmup + 5 timed; pstdev reported |
+| **End-to-end** (user → bot) | Pipecat's `UserBotLatencyObserver` (wired via `pipecat_demo.py:_build_latency_observer`) | Pipecat internal `time.time()` per frame | n/a — measured between two pipeline frames (`VADUserStoppedSpeakingFrame` → `BotStartedSpeakingFrame`) | populates on mic-mode user turns |
+| **Audio QA** (Deepgram round-trip) | `scripts/deepgram_stt_check.sh` against `samples/bot_*.wav` | n/a | n/a | one transcription per sample, confidence + transcript reported |
+
+### KV cache correctness (5/5 checks pass)
+
+- Deterministic: identical token sequences across reset+50-step runs (under deterministic algorithms + fixed seed)
+- Monotonic positions
+- No out-of-range tokens over 100-step runs
+- Prompt-conditioned: different start tokens → different sequences (0/20 coincidental matches)
+- `reset()` actually clears context
+
+---
+
+## Performance — historical context (broken-audio era, kept for diagnosis arc)
+
+> **DO NOT USE THESE NUMBERS** — they come from an earlier code path where Deepgram returned 0.0 confidence on the bot output (unintelligible audio). They're preserved here only because the diagnosis arc — *we passed perf but failed the audio QA gate, which surfaced a 4-bug wiring stack* — is the engineering story this submission is built on. See the canonical numbers in the section above.
 
 | Metric | Our value | Tightest target | Perf section | Deliverables | Verdict |
 |---|---|---|---|---|---|

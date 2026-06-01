@@ -69,19 +69,41 @@ What we modified: the seven constants above, the weight loader, and the
 LM-head block tuning. What we took as-is: GQA attention layout, SwiGLU math,
 RMSNorm shape, warp/block tiling, the C++ binding surface.
 
-### 2.2 Code Predictor (PyTorch, 5 layers)
+### 2.2 Code Predictor (PyTorch, 5 layers, AR sub-decode)
 
-A small auxiliary transformer (5 layers, hidden 1024, 16 codebook heads x
-vocab 2048) that takes one semantic token from the talker and emits a
-16-channel acoustic frame. Taken **as-is** from the Qwen3-TTS reference,
-instantiated as `nn.Module` and wrapped in
-`torch.compile(mode="reduce-overhead", dynamic=False)` against the stable
-`(1, 1)` shape for CUDA-Graph capture. This is the biggest per-frame cost in
-warm steady-state (~14 ms of the 16.7 ms frame budget). We kept it
-eager-then-compiled rather than fusing into the megakernel: brief scopes the
-megakernel to the talker decode loop, and the code predictor has different
-I/O shape (16 parallel heads, no KV cache, no MRoPE) -- `torch.compile` is
-the right tool here.
+A small auxiliary transformer (5 layers, hidden 1024, 16 per-codebook
+embedding + lm_head tables, vocab 2048 per codebook). The original integration
+treated it as a single-step parallel argmax over all 16 codebooks from a
+heuristically projected talker token — that was wrong (see §3 honest gaps).
+**The current integration matches upstream Qwen3-TTS exactly**:
+
+1. Per AR step, take the talker's last-layer hidden state (`past_hidden`) +
+   the previous codec token's embedding from `codec_embedding[0]` (`last_id_hidden`).
+2. Feed `cat(past_hidden, last_id_hidden)` into a 14-step AR sub-decode that
+   produces codebooks 1-15 sequentially (codebook 0 came from the talker
+   itself). Each codebook step does: 5-layer transformer forward over a tiny
+   KV cache → per-codebook RMSNorm + lm_head → top-k=20 sampling with
+   `temperature=0.5, repetition_penalty=1.05` (locked after polish A/B).
+3. Sum the 16 codebook embeddings to produce the next talker input via a
+   stacked `F.embedding` gather (Move F) — single kernel launch instead of
+   15 separate lookups.
+
+Implementation: `inference-server/qwen3_tts_components.py:472-586` for
+`generate_ar`; KV cache buffer is hoisted to `__init__` and zero-filled per
+call (Move B); SDPA uses `enable_gqa=True` to drop the `repeat_interleave`
+materialization; the 14-step inner loop is partially CUDA-graph-captured for
+shape-stable replay. This sub-decode currently dominates the per-AR-step
+budget at ~113 ms (76.9% of step time) — the main perf-recovery target
+identified by the per-component profiler.
+
+We kept the Code Predictor in PyTorch rather than fusing into the megakernel:
+the brief scopes the megakernel to the talker decode loop, and the code
+predictor has a different I/O shape (15 sequential codebook decodes with
+their own KV cache and per-codebook embedding tables) that doesn't fit the
+talker's persistent-thread layout. The follow-up perf move (estimated 1-2
+days) is a kernel-side variant that accepts a precomputed input embedding
+instead of an int token, so step_embed and CP decode can share a single
+persistent-grid launch.
 
 ### 2.3 Codec (PyTorch, clean-room reimpl, 271 weights)
 
@@ -303,19 +325,19 @@ dropped from ~80 s per second utterance to ~0.5 s on a 2 s clip.
 
 ---
 
-## 8. What we'd build next
+## 8. Honest gaps + what we'd build next
 
-Prioritised by impact-per-effort:
+**Honest gaps in the current submission** (also surfaced in README's "honest trade" section):
 
-1. **`torch.compile` warmup on service startup.** One synthetic forward
-   through code_predictor + codec at process boot. Drops cold-start Config B
-   TTFC from 694 ms to well under 100 ms. ~1 hour.
+- **Megakernel↔Qwen3-TTS wiring required a 4-bug fix** to produce intelligible audio: CodePredictor was driven by a heuristic int-token lookup (now upstream-faithful 15-step AR sub-decode); talker AR step was receiving codebook-0 alone (now `sum(16 codebook embeddings)`); greedy argmax on a sampling-trained model (now top-k=20 with temperature/rep-penalty per upstream `generation_config`); audio prefix was sequence-concatenated (now element-wise sum with text projection at matching positions). Audio QA via Deepgram nova-2 round-trip confirms intelligibility at 0.9995-1.000 confidence and matches the vanilla upstream `qwen_tts.Qwen3TTSModel` baseline.
+- **Perf regression — deliberate**: the 4-bug fix added a 15-step CodePredictor AR sub-decode per AR step in eager PyTorch. Bench numbers moved from TTFC 18.7 ms / RTF 0.123 (passing perf+deliverables tiers but producing unintelligible audio) to TTFC 74.5 ms / RTF 0.899. The talker megakernel itself is unchanged (still 437 tok/s decode-only); the perf cost lives entirely in the new CodePredictor sub-decode.
+- **MRoPE in CUDA is single-axis collapse** (Section 4). Math-equivalent for autoregressive-only decode; deferred for multi-modal prefill which the brief doesn't exercise.
 
-2. **Proper MRoPE in CUDA.** Replace the rotation loops in
-   `csrc/kernel.cu:344-409` with per-axis position lookup. Closes the
-   correctness gap in Section 4, unlocks real text-prefill in the kernel
-   (Python prefill shortcut no longer needed). ~1-2 GPU hours; math specced
-   in `e3-mrope-math.md`.
+**Prioritised next moves** (impact-per-effort):
+
+1. **CodePredictor AR sub-decode → kernel-side path** (the highest-impact perf recovery). Move the 15-step inner loop into a CUDA persistent-grid kernel that takes a precomputed input embedding instead of an int token. This unblocks `step_embed` + CP decode sharing a single kernel launch. Per-component profile shows CP at 113 ms / 76.9% of step — theoretical lower bound on a 5090 is 5-8 ms (bandwidth-bound). Estimated 1-2 focused GPU days. Projects RTF from 0.9 → 0.15-0.25 range with no further audio-quality change.
+
+2. **Proper MRoPE in CUDA.** Replace the rotation loops in `csrc/kernel.cu:344-409` with per-axis position lookup. Closes the Section 4 correctness gap, unlocks real text-prefill in the kernel (Python prefill shortcut no longer needed). ~1-2 GPU hours; math specced in `e3-mrope-math.md`.
 
 3. **Full e2e voice-loop validation.** `pipecat_demo.py` runs end-to-end on
    the Vast box, but we have not done a closed-loop "speak into mic, hear

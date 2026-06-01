@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import torch  # type: ignore
 from loguru import logger
 
 # Qwen3-TTS native codec rate -- confirmed from Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
@@ -238,6 +239,28 @@ class MegakernelTTS:
         # on the first generate() call so we know which device/dtype to bind.
         self._per_frame_fn = None
         self._per_frame_warmed = False
+        # W5-Move-F: cached stacked codec_embedding weight for the per-frame
+        # talker-input "summed" reconstruction. Each AR step previously ran a
+        # Python loop of 15 separate `nn.Embedding` lookups + adds. We replace
+        # that with a single F.embedding over a stacked (15*2048, 2048)
+        # weight matrix using offset-shifted indices, then a single sum.
+        # Lazy-built on first use because we need cp.codec_embedding weights.
+        self._codec_emb_stacked: torch.Tensor | None = None  # (15*2048, 2048)
+        self._codec_emb_offsets: torch.Tensor | None = None  # (15,) long
+        # W7-Move-A: hoist per-step scratch buffers out of the AR loop. The
+        # old code called torch.zeros((1,1,16), ...) every step (~30+ steps
+        # per utterance = ~30 small CUDA allocs / step). Reusing one buffer
+        # with `_buf[0,0,0] = prev_tok; _buf[0,0,1:] = cb_preds_15` is one
+        # in-place write + one slice assign instead. Lazy-built on first
+        # generate() call because we need self.config.device.
+        self._codes_16_buf: torch.Tensor | None = None        # (1, 1, 16) long
+        self._prev_tok_buf_ar: torch.Tensor | None = None     # (1,) long
+        # W7-Move-B: torch.compile-wrapped codec call. Codec input shape is
+        # FIXED at (1, 1, 16) every step, output PCM shape is FIXED. Ideal
+        # for torch.compile(mode="reduce-overhead") graph capture. Lazy on
+        # first generate() call so compile-time doesn't bloat __init__.
+        self._codec_compiled = None
+        self._codec_compile_failed: bool = False
 
         if self.config.stub:
             logger.warning(
@@ -260,8 +283,9 @@ class MegakernelTTS:
         )
         logger.info("MegakernelTTS: Decoder loaded from {p}", p=self.config.model_path)
 
-        from qwen3_tts_components import load_components  # type: ignore
-        import torch  # type: ignore
+        from qwen3_tts_components import load_components, CP_CODEBOOK_VOCAB as _CP_VOCAB  # type: ignore
+        # bind module-level constant for the AR loop (used by Move F).
+        globals()["CP_CODEBOOK_VOCAB"] = _CP_VOCAB
 
         # H1 fix: load_components() now returns 3-tuple (cp, codec, info)
         # after the real-codec rewrite. Unpacking 2 silently flipped the
@@ -295,19 +319,12 @@ class MegakernelTTS:
         if self.config.compile_per_frame:
             try:
                 logger.info(
-                    "MegakernelTTS: pre-warming compile + prefill_text "
-                    "(this takes ~20-25 s at model load, amortizes per-turn)…"
+                    "MegakernelTTS: pre-warming prefill_text "
+                    "(per-frame compile warmup disabled — AR loop now goes "
+                    "through the multi-codebook CP path which the legacy "
+                    "per_frame(token_id) fn no longer supports)…"
                 )
                 t0 = time.perf_counter()
-                # Phase 1: per-frame fn compile + CUDA graph capture (3 iters,
-                # token id 0). ``_call`` handles cudagraph_mark_step_begin.
-                per_frame = self._build_per_frame_fn()
-                for _ in range(3):
-                    _ = per_frame(0)
-                logger.info(
-                    "MegakernelTTS: per-frame compile warmup done in {s:.1f} s",
-                    s=time.perf_counter() - t0,
-                )
                 # Phase 2: prefill_text warmup. The talker's prefill_text
                 # triggers a PyTorch forward through the text-projection
                 # submodule on first call — ~1.5 s cold, <50 ms warm. Do it
@@ -332,6 +349,44 @@ class MegakernelTTS:
                     "run_tts() will pay the compile cost.",
                     err=e,
                 )
+
+            # Phase 2-warmup: exercise the FULL AR-loop once so the new
+            # multi-codebook CP path (step_embed + CP.generate_ar + 16-cb
+            # embedding sum) finishes its torch.compile JIT before any
+            # production turn lands. Without this the first user turn
+            # blocks for 30-90s on cold compile, which feels like a hang.
+            try:
+                import asyncio
+                t2 = time.perf_counter()
+                logger.info("MegakernelTTS: pre-warming full AR loop (one short utterance)...")
+
+                async def _warmup_full_ar():
+                    n = 0
+                    async for _chunk in self.generate("Hello there."):
+                        n += 1
+                        if n >= 8:  # ~8 codec frames = ~640 ms of audio — enough to JIT-compile
+                            break
+                    return n
+
+                # Run in an isolated event loop so we don't conflict with any
+                # outer asyncio context (e.g. Pipecat or Gradio's queue).
+                try:
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(_warmup_full_ar())
+                    loop.close()
+                    logger.info(
+                        "MegakernelTTS: full AR-loop warmup done in {s:.1f} s "
+                        "(first user turn now amortized; subsequent turns warm).",
+                        s=time.perf_counter() - t2,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "MegakernelTTS: full AR warmup failed ({err!r}); "
+                        "first user turn will pay the cold-compile cost.",
+                        err=e,
+                    )
+            except ImportError:
+                pass
 
     @property
     def sample_rate(self) -> int:
@@ -359,8 +414,6 @@ class MegakernelTTS:
         """
         if self._per_frame_fn is not None:
             return self._per_frame_fn
-
-        import torch  # type: ignore
 
         code_predictor = self._code_predictor
         codec = self._codec
@@ -427,6 +480,7 @@ class MegakernelTTS:
         text: str,
         *,
         text_prefill: bool | None = None,
+        max_new_tokens: int | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """Stream PCM audio chunks for ``text``.
 
@@ -474,6 +528,8 @@ class MegakernelTTS:
 
         # Reset KV cache for the new utterance.
         self._talker.reset()
+        # Reset per-utterance code-predictor feedback state.
+        self._prev_cb_preds = None
 
         # Single-pass combined prefill matching the upstream Qwen3-TTS flow
         # (modeling_qwen3_tts.py:1240-1295). The text (wrapped in the
@@ -513,53 +569,146 @@ class MegakernelTTS:
                     err=e,
                 )
 
-        # First AR step seeds codec_bos (2149) — the upstream "begin generating
-        # audio" sentinel. The kernel writes its embedding at the next position
-        # and predicts the first audio token from that state.
-        prev_tok: int = QWEN3_TTS_CODEC_BOS_TOKEN_ID if do_prefill else 0
-
-        max_new = self.config.max_new_tokens
+        # Per-call cap.
+        max_new = max_new_tokens if max_new_tokens is not None else self.config.max_new_tokens
         eos = self.config.eos_token_id
 
-        per_frame = self._build_per_frame_fn()
-
-        # Trailing-text injection per upstream Qwen3-TTS
-        # (modeling_qwen3_tts.py:1689-1692): each AR step's input embedding
-        # is `codec_embedding[prev_tok] + trailing_text_hidden[step_idx]`
-        # (or `tts_pad_embed` once trailing_text is exhausted). This is the
-        # ongoing text-to-audio alignment that keeps the talker on-phoneme
-        # — without it the model has only seen the text once (in prefill)
-        # and drifts off into speech-like babble.
+        # Trailing-text injection per upstream Qwen3-TTS.
         trailing = self._talker.trailing_text_hiddens if do_prefill else None
         pad_emb = self._talker.tts_pad_embed() if do_prefill else None
-        import torch  # type: ignore
         device = self.config.device
-        embed_weight = self._talker._embed_weight  # (3072, HIDDEN)
+        embed_weight = self._talker._embed_weight  # (3072, talker_hidden=2048)
+        cp = self._code_predictor
+        codec = self._codec
+
+        # Prefill provides (first_tok, past_hidden_after_prefill) when do_prefill=True.
+        # This matches upstream where talker.generate's first iteration samples
+        # from the prefill's last-position hidden — no separate bootstrap step.
+        if do_prefill and getattr(self._talker, "_stashed_first_tok", None) is not None:
+            prev_tok = int(self._talker._stashed_first_tok)
+            past_hidden = self._talker._stashed_first_past_hidden  # (1, 1, 2048)
+        else:
+            prev_tok = QWEN3_TTS_CODEC_BOS_TOKEN_ID if do_prefill else 0
+            past_hidden = torch.zeros((1, 1, 2048), dtype=torch.bfloat16, device=device)
+
+        # W7-Move-A: instance-level buffers (allocated once, reused per step).
+        if self._prev_tok_buf_ar is None or self._prev_tok_buf_ar.device.type != "cuda":
+            self._prev_tok_buf_ar = torch.zeros((1,), dtype=torch.long, device=device)
+            self._codes_16_buf = torch.zeros((1, 1, 16), dtype=torch.long, device=device)
+        prev_tok_buf = self._prev_tok_buf_ar
+        codes_16 = self._codes_16_buf
+
+        # W7-Move-B: build the compiled codec on first call. The codec call
+        # has FIXED input shape (1, 1, 16) and FIXED output PCM shape, which
+        # is exactly what torch.compile(mode="reduce-overhead") wants for
+        # CUDA-graph replay. Falls back to raw codec on capture failure.
+        codec_call = codec
+        if (
+            self.config.compile_per_frame
+            and self._codec_compiled is None
+            and not self._codec_compile_failed
+        ):
+            try:
+                @torch.no_grad()
+                def _codec_raw(c16: "torch.Tensor") -> "torch.Tensor":
+                    return codec(c16)
+                self._codec_compiled = torch.compile(
+                    _codec_raw, mode="reduce-overhead", dynamic=False
+                )
+                logger.info(
+                    "MegakernelTTS: codec wrapped in "
+                    "torch.compile(mode='reduce-overhead')."
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "MegakernelTTS: codec torch.compile failed ({err!r}); "
+                    "falling back to eager codec.",
+                    err=e,
+                )
+                self._codec_compile_failed = True
+                self._codec_compiled = None
+        if self._codec_compiled is not None:
+            codec_call = self._codec_compiled
+
+        _cudagraph_mark = getattr(
+            getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None
+        )
+
+        if prev_tok == eos:
+            self._prev_cb_preds = None
+            return
+
+        # W6-Move-J: codec on a SIDE STREAM. After CP emits cb_preds_15, the
+        # codec frame decode (~7 ms) and the talker step_embed (~5 ms) are
+        # independent — both only depend on cb_preds_15. Putting codec on a
+        # side stream lets them overlap on the GPU. Net win ~5 ms/step at the
+        # cost of one extra stream sync per step.
+        codec_stream = getattr(self, "_codec_stream", None)
+        if codec_stream is None and torch.cuda.is_available():
+            self._codec_stream = torch.cuda.Stream()
+            codec_stream = self._codec_stream
+
+        # Lazy-init codec_emb_stacked outside the hot loop.
+        if self._codec_emb_stacked is None:
+            self._codec_emb_stacked = torch.cat(
+                [cp.codec_embedding[i].weight for i in range(15)],
+                dim=0,
+            ).to(torch.bfloat16).contiguous()  # (15*2048, 2048)
+            self._codec_emb_offsets = (
+                torch.arange(15, device=device, dtype=torch.long) * CP_CODEBOOK_VOCAB
+            )
 
         for step_idx in range(max_new):
-            # Build the talker input for THIS step. Pure embedding-space:
-            #   prev_tok's codec_embedding row  +  per-step text conditioning
-            tok_emb = torch.nn.functional.embedding(
-                torch.tensor([prev_tok], dtype=torch.long, device=device),
-                embed_weight,
-            ).view(1, 1, -1).to(torch.bfloat16)
+            # ---- (A) Code-predictor sub-decode for codebooks 1..15 ----
+            prev_tok_buf.fill_(prev_tok)
+            last_id_hidden = embed_weight[prev_tok_buf].view(1, 1, -1).to(torch.bfloat16)
+            cb_preds_15 = cp.generate_ar(past_hidden, last_id_hidden)  # (15,) long
+
+            # ---- (B) Codec — issue on side stream, sync at the end of step ----
+            codes_16[0, 0, 0] = prev_tok
+            codes_16[0, 0, 1:] = cb_preds_15
+            if codec_stream is not None:
+                # Side stream must wait until default stream finished cb_preds_15.
+                codec_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(codec_stream):
+                    if self._codec_compiled is not None and _cudagraph_mark is not None:
+                        _cudagraph_mark()
+                    pcm = codec_call(codes_16)
+            else:
+                if self._codec_compiled is not None and _cudagraph_mark is not None:
+                    _cudagraph_mark()
+                pcm = codec_call(codes_16)
+
+            # ---- (C) Build talker input embedding & ---- (D) Talker step
+            # These run on the DEFAULT stream concurrently with codec on the
+            # side stream — both depend only on cb_preds_15 (already done).
+            stacked_idx = cb_preds_15 + self._codec_emb_offsets  # (15,) long
+            extra = self._codec_emb_stacked.index_select(0, stacked_idx)  # (15, 2048) bf16
+            summed = last_id_hidden + extra.sum(dim=0).view(1, 1, -1)
+
             if trailing is not None and trailing.shape[0] > 0:
                 if step_idx < trailing.shape[0]:
                     text_emb = trailing[step_idx].view(1, 1, -1)
                 else:
                     text_emb = pad_emb
-                step_input = tok_emb + text_emb.to(tok_emb.dtype)
+                step_input = summed + text_emb.to(summed.dtype)
             else:
-                step_input = tok_emb
+                step_input = summed
 
-            next_tok = self._talker.step_embed(step_input)
+            next_tok, past_hidden = self._talker.step_embed(step_input, return_hidden=True)
+
+            # ---- (E) Wait for codec, convert to bytes, yield ----
+            if codec_stream is not None:
+                torch.cuda.current_stream().wait_stream(codec_stream)
+            yield _pcm_tensor_to_bytes(pcm)
+
             if next_tok == eos:
                 break
 
-            pcm_bytes = per_frame(next_tok)
-            yield pcm_bytes
-
             prev_tok = next_tok
+
+        # Clear per-utterance state.
+        self._prev_cb_preds = None
 
     async def _stub_generate(self, text: str) -> AsyncGenerator[bytes, None]:
         """Emit silence sized roughly proportional to ``text``.
@@ -600,6 +749,24 @@ def _f32_to_i16_bytes(pcm_f32: "np.ndarray") -> bytes:
     """
     clipped = np.clip(pcm_f32, -1.0, 1.0)
     return (clipped * 32767.0).astype(np.int16).tobytes()
+
+
+def _pcm_tensor_to_bytes(pcm) -> bytes:
+    """Convert codec output (bytes / np / Tensor) to int16 LE PCM bytes.
+
+    Handles all return types the codec might produce. Used by the AR-loop's
+    `pending_pcm` drain — kept module-level so it doesn't capture `self`.
+    """
+    if isinstance(pcm, (bytes, bytearray)):
+        return bytes(pcm)
+    if isinstance(pcm, np.ndarray):
+        return pcm.astype(np.int16).tobytes()
+    t = pcm.detach()
+    if t.dtype == torch.int16:
+        return t.to("cpu").contiguous().view(-1).numpy().tobytes()
+    arr = t.to("cpu").to(torch.float32).view(-1).numpy()
+    arr = np.clip(arr, -1.0, 1.0)
+    return (arr * 32767.0).astype(np.int16).tobytes()
 
 
 def measure_ttfc_ns(start_ns: int) -> int:

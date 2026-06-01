@@ -472,11 +472,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--decode-model",
-        default="Qwen/Qwen3-0.6B",
+        default="/workspace/qwen3-tts-1.7b",
         help=(
-            "HF checkpoint for the bare-Talker tok/s bench. Defaults to the "
-            "qwen_megakernel-supported Qwen3-0.6B; switch to the 1.7B Qwen3-TTS "
-            "Talker once kernel mods land."
+            "Local path (or HF checkpoint) for the bare-Talker tok/s bench. "
+            "Default targets the 1.7B Qwen3-TTS Talker — kernel constants are "
+            "retuned for it (HIDDEN_SIZE=2048, INTERMEDIATE_SIZE=6144, "
+            "VOCAB_SIZE=3072). Pre-megakernel-AR baseline was Qwen/Qwen3-0.6B."
         ),
     )
     p.add_argument("--speaker", default="ryan")

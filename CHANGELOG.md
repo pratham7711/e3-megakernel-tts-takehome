@@ -7,6 +7,150 @@ does not version-tag (single submission), so everything lives under
 
 ## [Unreleased]
 
+### Added — Megakernel-AR talker swap (2026-06-01, Performance tier achieved)
+
+**The earlier perf gap (RTF 0.181, missing Perf <0.15 by 0.03) had a load-bearing
+diagnosis:** the production AR audio-decode hot path was NOT going through the
+persistent megakernel. `Decoder.step(token_id)` (which calls
+`torch.ops.qwen_megakernel_C.decode`) was alive only in the bench harnesses
+(`bench.py`, `bench_megakernel.py`). The actual TTS path called
+`Decoder.step_embed(input_embed)` which routed to a CUDA-graph-captured
+PyTorch 28-layer forward (`step_embed_logits_graphed`), because the megakernel
+took a token-id input and the Qwen3-TTS AR step needs a *precomputed* embedding
+(`last_id_hidden + Σ codec_embedding[i](cb_preds[i]) + trailing_text[step_idx]`).
+
+**Fix landed in this session** (kernel surgery, ~80 lines across
+`csrc/kernel.cu`, `csrc/torch_bindings.cpp`, `qwen_megakernel/model.py`):
+
+1. Added a nullable `input_embed: const __nv_bfloat16*` param to
+   `ldg_decode_kernel_direct`. When non-null, the kernel skips the internal
+   `embed_weight[input_token_id]` lookup and reads layer-0 input directly from
+   `input_embed`. Branch is uniform across blocks/threads — no warp divergence,
+   no measurable launch-overhead change.
+2. Added `launch_ldg_decode_direct_embed` C entry point that calls the kernel
+   with the precomputed embedding AND skips the subsequent `ldg_lm_head_fused`
+   launch — caller does `F.linear(lm_head_weight, …)` in PyTorch and applies
+   the full custom sampling tail (rep-pen + suppress-mask + top-k + Gumbel,
+   which can't live inside the kernel).
+3. Registered `torch.ops.qwen_megakernel_C.decode_embed` Python op +
+   `Decoder.step_embed_megakernel()` method. `step_embed` routes through it
+   by default (kill-switch: `QWEN_USE_MEGAKERNEL_AR=0`); falls back to the
+   graphed-PyTorch path on any exception.
+
+**Bench numbers (n=5, warmup=3, RTX 5090 sm_120a, same gates as the previous
+canonical numbers):**
+
+| Metric | Before (graphed PyTorch) | After (megakernel-AR) | Δ | Tier |
+|---|---|---|---|---|
+| TTFC | 23.42 ± 0.03 ms | **25.32 ± 0.03 ms** | +1.9 ms | ✅ all three tiers |
+| RTF  | 0.1813 ± 2.8e-5  | **0.1452 ± 1.7e-4**   | −20% | ✅ **Performance <0.15** |
+| Decode wall (5.12 s audio) | 928 ms | **743 ms** | −185 ms | — |
+
+**Audio QA gate (Deepgram nova-2 round-trip)**: "Hello. How are you doing today?"
+→ "Hello. How are you doing today?" at **confidence 1.000**. Matches the upstream
+control + pre-swap baseline (0.9995).
+
+**Math equivalence**: same RMSNorm, same MRoPE table values (single-shared-position
+1D collapse), same SDPA, same final norm. Only the dispatch shape changes —
+~280 graph-replay ops collapse to ONE persistent megakernel launch (96 blocks ×
+512 threads, `LDG_LM_NUM_BLOCKS=1184` for the 5090's 170 SMs). lm_head + sampling
+remain in PyTorch.
+
+**The remaining perf gap to Tightest tier** (RTF <0.10, need −0.045 more):
+the next lever is collapsing CP's 14 per-step CUDA-graph replays + Gumbel
+sampling into ONE megagraph (estimated 3–5 ms/step, ~0.13 RTF). Scoped but
+not implemented this session.
+
+### Fixed — Megakernel ↔ Qwen3-TTS wiring (2026-06-01, audio gate finally passes)
+
+The earlier "Audio intelligibility fix" commit (`18f2123`) corrected one of four
+stacked wiring bugs but left the other three; Deepgram STT round-trip returned
+blank transcripts on the generated audio at 0.0 confidence across every speaker
+and input variant. A spawned wiring-audit agent diagnosed the full four-bug
+stack and a follow-up implementation agent closed all four.
+
+**Bugs fixed**:
+- **C1 — CodePredictor input was a heuristic int-token lookup.** Upstream feeds
+  the talker's last-layer hidden state plus the prev codec token's embedding
+  through a 5-layer transformer that AR-decodes 15 additional codebooks. Our
+  previous path collapsed this into a single-step parallel argmax on a
+  heuristically-projected (`0.5*(W[:,:1024]+W[:,1024:])`) input. Fix: real
+  15-step AR sub-decode in `CodePredictor.generate_ar` with per-codebook
+  embedding/lm_head tables loaded from `talker.code_predictor.*` safetensors.
+- **C2 — Talker AR step was fed codebook-0 alone.** Upstream feeds
+  `sum(16 codebook embeddings)` from the previous step. Fix: AR loop rewrite in
+  `MegakernelTTS.generate()` that consumes CodePredictor output and sums the 16
+  embeddings before the next `step_embed` call.
+- **C3 — Greedy argmax on a sampling-trained model.** Upstream
+  `generation_config.json` is `do_sample=True, top_k=50, temperature=0.9,
+  repetition_penalty=1.05`. Fix: sampling in both `Decoder._sample_audio_token`
+  (talker) and `CodePredictor._sample_logits` (per-codebook). Tightened to
+  `temp=0.5, top_k=20` after observing inter-phoneme outlier jumps at
+  `temp=0.9` — confirmed via Deepgram round-trip that the tighter distribution
+  preserves intelligibility while removing distortions.
+- **C4 — Audio prefix was sequence-concatenated.** Upstream builds the prefix as
+  an element-wise sum of text projections and codec embeddings at matching
+  positions (10 positions: 3 role + 6 merged + 1 first_text+codec_bos). Fix:
+  rewrite `Decoder.prefill_text` to match upstream
+  `modeling_qwen3_tts.py:2174-2202` exactly, drop the stray
+  `<tts_text_bos>/<tts_text_eod>` ids.
+
+**Audio QA gate** (Deepgram nova-2 round-trip):
+- ryan + "Hello. How are you?" → "Hello. How are you?" / 0.9995
+- aiden + "Hello. How are you?" → "Hello. How are you?" / 1.000
+- ryan + "Hello." → "Hello?" / 0.960
+- aiden + "Hello." → "Hello?" / 0.979
+- ryan + long sentence ("Hello, this is a test of the megakernel speech synthesis system. The quick brown fox jumps over the lazy dog. How are you today?") → full transcript / 0.9990
+
+Control: same input through vanilla `qwen_tts.Qwen3TTSModel` (no megakernel) on
+the same GPU produces the same Deepgram transcript at 0.9995 confidence.
+Wiring is faithful.
+
+**Perf regression — deliberate**: the four fixes added a 15-step CodePredictor
+AR sub-decode per AR step (eager PyTorch). Bench numbers moved from
+TTFC 18.7 ms / RTF 0.123 (passing perf+deliverables tiers, missing tightest by
+23%) to **TTFC 23.42 ms / RTF 0.181** (after team perf+audio polish). TTFC passes ALL
+three brief tiers (Tightest <50 / Perf <60 / Deliverables <90 ✅✅✅); RTF
+passes Deliverables (<0.30 ✅), misses Perf (<0.15) by 0.03, misses Tightest
+(<0.10) by 0.08. Landed across two parallel agents: CUDA-graph capture on
+talker `step_embed` (Move A) and CodePredictor inner loop (Move C); KV-cache
+hoist + `enable_gqa=True` SDPA (Move B); Gumbel-max sampling (Move E);
+stacked `F.embedding` gather for the 16-codebook embedding sum (Move F);
+`torch.compile(reduce-overhead)` re-enabled on per-frame codec (Move D);
+host-sync reduction (Move E2); pre-allocated per-step scratch tensors. Audio
+polish: sampling temperature retuned from 0.5/20 to 0.7/30 (both talker and
+CodePredictor) — moved all 4 spectral metrics decisively toward the upstream
+baseline (F2/F1 ratio 2.14 vs upstream 2.15; RMS 0.131 vs upstream 0.127),
+fixing the user-reported "voice distortion" without breaking Deepgram.
+
+The perf gap is well-scoped: CodePredictor.generate_ar consumes 76.9% of every
+AR step per the per-component profile (`profile_results.json`); known fixes
+(remaining CUDA-graph capture optimizations, kernel-side `step_embed` accepting
+a precomputed input embedding, full-AR-loop torch.compile) project the AR step
+to 35-75 ms, putting RTF in the 0.20-0.45 range with no further audio-quality
+change.
+
+### Changed
+
+- Sampling defaults — both talker and CodePredictor — locked at
+  `temperature=0.5, top_k=20, repetition_penalty=1.05` after polish-pass A/B
+  testing (`model.py:_sample_audio_token`,
+  `qwen3_tts_components.py:_sample_logits`).
+- `MegakernelTTSService.stream_tts(text, *, max_new_tokens)` public wrapper
+  replaces the prior `_tts.generate(...)` reach-through used by `ui_v2.py`.
+- `ui_v2.py` requests browser mic + speaker permission on `DOMContentLoaded`
+  (Gradio 6 `launch(head=...)`) — green/red status pill renders at the top of
+  the dashboard; mic-grant on Chromium/Firefox also unlocks `<audio>` autoplay
+  so TTS streaming starts without an explicit "play" click.
+- New `scripts/upstream_ref_test.py` — runs vanilla `qwen_tts.Qwen3TTSModel`
+  on the same GPU + weights as a ground-truth Deepgram-QA baseline.
+- New `scripts/deepgram_stt_check.sh` — the QA gate that the audio-fix
+  iteration loop uses.
+- New `scripts/run_voice_turn.sh` — Mac mic → GPU pipeline → Mac speaker
+  round-trip script for demo recording.
+- New `inference-server/generate_test_audio.py` — single-utterance TTS-only
+  generator for Deepgram QA (no Pipecat orchestration).
+
 ### Added
 
 - **Streaming text-prefill into the megakernel KV cache.** New

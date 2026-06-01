@@ -17,6 +17,15 @@ Why two input modes?
 The GPU box (Ubuntu 22, NGC PyTorch 2.10) is typically headless -- no mic, no
 speakers. To validate Step 4 (end-to-end) we support both:
 
+The transport supports two modes: ``mic`` for an interactive workstation run
+and ``file`` for a deterministic one-shot used by the bench / smoke tests.
+The earlier ``webrtc`` browser-tab mode was removed: WebRTC media is UDP and
+SSH tunnels only carry TCP, so the live path required either a TURN relay
+(account-bound credentials) or re-renting the GPU box with `-p UDP:N:M` —
+both of those are out-of-band setup steps that don't belong in the brief's
+deliverable. The brief's metrics (TTFC / RTF / decode tok/s / e2e) are all
+measured in ``mic`` and ``file`` modes; nothing was lost.
+
 * ``INPUT_MODE=mic`` (default on a workstation) -- uses
   ``LocalAudioInputTransport`` + ``LocalAudioOutputTransport``. Requires
   PyAudio + portaudio + a real audio device. Press Ctrl+C to exit.
@@ -46,21 +55,15 @@ Env vars (loaded from ``.env`` next to this file):
     HF_TOKEN=...                       # optional, for gated checkpoint pulls
 
     # --- Transport ---
-    INPUT_MODE=mic                     # "mic" | "file" | "webrtc"
+    INPUT_MODE=mic                     # "mic" | "file"
     INPUT_WAV=/workspace/samples/user_utterance.wav  # required when INPUT_MODE=file
     OUTPUT_WAV=/workspace/samples/bot_response.wav   # used when INPUT_MODE=file
-
-    # --- WebRTC (browser tab on the GPU server) ---
-    WEBRTC_HOST=0.0.0.0                # bind address for the FastAPI server
-    WEBRTC_PORT=8081                   # port (8080 is reserved for ui_v2 Gradio)
 
 Run::
 
     cd inference-server
     cp .env.example .env  # fill in DEEPGRAM_API_KEY + LLM_API_KEY
     python3 pipecat_demo.py
-    # Or, for the browser conversation mode (headless GPU + SSH-tunneled :8081):
-    INPUT_MODE=webrtc python3 pipecat_demo.py
 """
 
 from __future__ import annotations
@@ -104,9 +107,17 @@ from pipecat.observers.user_bot_latency_observer import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.deepgram.stt import DeepgramSTTService
 
+# Ensure ``qwen_megakernel`` (CUDA megakernel; sibling to inference-server/) is
+# importable before MegakernelTTSService tries to load Decoder. ui_v2.py and
+# generate_test_audio.py rely on PYTHONPATH=/workspace/qwen_megakernel_modified
+# being set in the shell; we replicate that here so plain ``python3
+# pipecat_demo.py`` works from inference-server/ without extra env wiring.
+_QMK_DIR = os.environ.get("QWEN_MEGAKERNEL_DIR", "/workspace/qwen_megakernel_modified")
+if _QMK_DIR and _QMK_DIR not in sys.path:
+    sys.path.insert(0, _QMK_DIR)
+
 # Local-package import: pipecat_demo.py runs from inference-server/.
 from megakernel_tts_service import MegakernelTTSService
-
 
 class BotAudioRecorder(FrameProcessor):
     """Capture ONLY TTS output to a WAV. No user-input mixing.
@@ -671,294 +682,6 @@ async def _run_file_mode(stt, llm, tts, context, aggregators) -> None:
     bot_recorder.save()
 
 
-# ---------------------------------------------------------------------------
-# Browser conversation mode (headless GPU + WebRTC + Pipecat SmallWebRTC)
-# ---------------------------------------------------------------------------
-
-
-# Minimal browser client. Pipecat ships ``pipecat_ai_prebuilt`` for a richer UI,
-# but we don't want to make that a hard dep — the GPU box may not have it. This
-# inline page is enough to validate the loop end-to-end: it captures the mic,
-# POSTs an SDP offer to ``/api/offer``, attaches the bot's incoming audio track
-# to a hidden <audio>, and shows a status line.
-_WEBRTC_HTML_CLIENT = """<!doctype html>
-<html lang=en>
-<head>
-<meta charset=utf-8>
-<title>Megakernel TTS — Voice Agent</title>
-<style>
-  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 4em auto; padding: 0 1em; color: #222; }
-  h1 { font-weight: 600; margin-bottom: 0.25em; }
-  p.sub { color: #666; margin-top: 0; }
-  button { font: inherit; padding: 0.6em 1.2em; border-radius: 6px; border: 1px solid #888; cursor: pointer; background: #f6f6f6; }
-  button:hover { background: #eee; }
-  button.stop { background: #ffe2e2; border-color: #c66; }
-  #status { margin-top: 1.5em; font-family: ui-monospace, Menlo, monospace; font-size: 13px; color: #555; white-space: pre-wrap; }
-</style>
-</head>
-<body>
-<h1>Megakernel TTS — Voice Agent</h1>
-<p class=sub>Click <b>Start</b>, allow mic access, then just talk. The bot greets first, then replies whenever you finish a turn.</p>
-<button id=go>Start</button>
-<button id=stop class=stop disabled>Stop</button>
-<audio id=bot autoplay></audio>
-<pre id=status></pre>
-<script>
-const goBtn = document.getElementById('go');
-const stopBtn = document.getElementById('stop');
-const audioEl = document.getElementById('bot');
-const statusEl = document.getElementById('status');
-let pc = null, micStream = null;
-
-function log(s) { statusEl.textContent += s + "\\n"; statusEl.scrollTop = statusEl.scrollHeight; }
-
-async function start() {
-  goBtn.disabled = true;
-  log('requesting microphone...');
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-
-  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-  pc.ontrack = (ev) => {
-    log('bot audio track received');
-    audioEl.srcObject = ev.streams[0];
-  };
-  pc.onconnectionstatechange = () => log('pc state: ' + pc.connectionState);
-
-  for (const track of micStream.getTracks()) pc.addTrack(track, micStream);
-  // Force a recvonly audio transceiver so the server-side track has a slot
-  // even before its first chunk lands.
-  pc.addTransceiver('audio', { direction: 'recvonly' });
-
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  log('posting SDP offer to /api/offer...');
-  const resp = await fetch('/api/offer', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
-  });
-  if (!resp.ok) { log('offer failed: ' + resp.status); return; }
-  const ans = await resp.json();
-  await pc.setRemoteDescription(ans);
-  log('connected. start talking.');
-  stopBtn.disabled = false;
-}
-
-function stop() {
-  stopBtn.disabled = true;
-  if (pc) { pc.close(); pc = null; }
-  if (micStream) { for (const t of micStream.getTracks()) t.stop(); micStream = null; }
-  log('stopped.');
-  goBtn.disabled = false;
-}
-
-goBtn.addEventListener('click', () => { start().catch(e => log('error: ' + e)); });
-stopBtn.addEventListener('click', stop);
-</script>
-</body>
-</html>
-"""
-
-
-async def _run_webrtc_mode(stt, llm, tts, build_context_fn) -> None:
-    """Browser-mic / browser-speaker pipeline (headless GPU + SSH-tunnelled).
-
-    Architecture:
-
-    * One FastAPI/uvicorn server listens on ``WEBRTC_PORT`` (default 8081 —
-      8080 is owned by ui_v2.py Gradio so the two coexist).
-    * ``GET /`` returns ``_WEBRTC_HTML_CLIENT`` — the browser opens that in a
-      tab and clicks Start. WebRTC needs ``getUserMedia`` which Chrome
-      restricts to secure contexts; ``localhost``/``127.0.0.1`` count as
-      secure, so an SSH tunnel of ``-L 8081:localhost:8081`` works out of the
-      box without TLS.
-    * ``POST /api/offer`` accepts the browser's SDP and starts ONE pipeline
-      instance per connection. We spin up a fresh ``MegakernelTTSService``
-      could be expensive — but we already loaded the model once for stt/llm
-      construction, so the per-connection pipeline reuses the same service
-      objects passed in here.
-
-    Why not Pipecat's ``runner.run.main()``? It hardcodes ``localhost`` +
-    ``7860``, mounts the ``pipecat_ai_prebuilt`` UI (extra dep), and discovers
-    bot modules by filename — we want one process, port 8081, inline HTML,
-    and the existing ``run()`` entry point. The transport itself
-    (``SmallWebRTCTransport`` + ``SmallWebRTCRequestHandler``) does all the
-    heavy lifting; we just glue them to a 30-line FastAPI app.
-    """
-    try:
-        import uvicorn
-        from fastapi import BackgroundTasks, FastAPI
-        from fastapi.responses import HTMLResponse, JSONResponse
-        from pipecat.transports.base_transport import TransportParams
-        from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
-        from pipecat.transports.smallwebrtc.request_handler import (
-            SmallWebRTCRequest,
-            SmallWebRTCRequestHandler,
-        )
-        from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
-        from pipecat.processors.audio.vad_processor import VADProcessor
-        from pipecat.audio.vad.vad_analyzer import VADParams
-    except ImportError as exc:
-        logger.error(
-            "WebRTC mode requires `pip install pipecat-ai[webrtc] fastapi uvicorn` "
-            "(needs aiortc + av on the host). Original import error: {e}",
-            e=exc,
-        )
-        sys.exit(4)
-
-    host = os.environ.get("WEBRTC_HOST", "0.0.0.0")
-    # Default 8081 so ui_v2.py (Gradio) can own 8080 and embed/link this
-    # WebRTC backend on 8081. WEBRTC_PORT env var still overrides.
-    port = int(os.environ.get("WEBRTC_PORT", "8081"))
-
-    # ICE: default to a single Google STUN server. Inside the SSH tunnel the
-    # connection is loopback so STUN isn't strictly required, but quoting it
-    # keeps the offer/answer self-consistent if the user ever exposes the box
-    # directly.
-    handler = SmallWebRTCRequestHandler()
-
-    metrics_sink: list[dict] = []
-
-    async def _run_bot_for_connection(connection: SmallWebRTCConnection) -> None:
-        """Build + run a fresh pipeline against one browser peer.
-
-        Each call is its own short-lived asyncio task spawned from the
-        FastAPI offer handler. We rebuild the LLM context + aggregator pair
-        per connection so conversation state doesn't leak between
-        reconnects; the heavy services (STT/LLM/TTS) are shared (passed in).
-        """
-        # 0.5s stop_secs lets the user pause mid-thought without the bot
-        # cutting in. Below ~0.35s the bot interrupts on every hesitation;
-        # above ~0.8s the conversation feels laggy. 0.5 is the Pipecat
-        # default sweet spot for English conversational voice.
-        vad = SileroVADAnalyzer(params=VADParams(stop_secs=0.5))
-
-        # TransportParams: 16 kHz in (Deepgram-friendly), 24 kHz out
-        # (Qwen3-TTS native — no resample). audio_out_10ms_chunks=4 ⇒ 40 ms
-        # per packet, the same cadence as `_run_mic_mode`.
-        params = TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            audio_in_sample_rate=16_000,
-            audio_out_sample_rate=24_000,
-        )
-
-        transport = SmallWebRTCTransport(
-            webrtc_connection=connection,
-            params=params,
-        )
-
-        # Per-connection conversation state.
-        context, aggregators = build_context_fn(vad)
-        user_aggregator, assistant_aggregator = aggregators
-
-        # SmallWebRTC has no built-in VAD (unlike LocalAudioTransport which
-        # accepts vad_analyzer on its params). We insert a VADProcessor
-        # between transport.input() and STT so the user aggregator's
-        # VADUserTurnStartStrategy sees VAD frames, the same way it does in
-        # mic mode. Without this the LLM only fires on STT transcription
-        # boundaries, which can miss a clean end-of-turn for short
-        # utterances.
-        vad_processor = VADProcessor(vad_analyzer=vad)
-
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                vad_processor,
-                stt,
-                user_aggregator,
-                llm,
-                tts,
-                transport.output(),
-                assistant_aggregator,
-            ]
-        )
-
-        latency_observer = _build_latency_observer(metrics_sink)
-
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(
-                enable_metrics=True,
-                enable_usage_metrics=True,
-                allow_interruptions=True,  # user can talk over the bot
-                audio_in_sample_rate=16_000,
-                audio_out_sample_rate=24_000,
-            ),
-            observers=[latency_observer],
-        )
-
-        @transport.event_handler("on_client_connected")
-        async def _on_connected(_transport, _client):
-            logger.info("WebRTC client connected — sending greeting")
-            # Inject a deterministic greeting prompt so the bot speaks first.
-            # The brief calls for "Hi! What would you like to talk about?";
-            # we steer the LLM toward that exact greeting rather than
-            # hard-coding a TTS frame so a single code path produces the
-            # greeting + all subsequent replies (same model, same voice).
-            context.add_message(
-                {
-                    "role": "developer",
-                    "content": (
-                        "Greet the user with exactly: "
-                        "'Hi! What would you like to talk about?' "
-                        "Do not add anything else."
-                    ),
-                }
-            )
-            await task.queue_frames([LLMRunFrame()])
-
-        @transport.event_handler("on_client_disconnected")
-        async def _on_disconnected(_transport, _client):
-            logger.info("WebRTC client disconnected — tearing down task")
-            await task.cancel()
-
-        runner = PipelineRunner(handle_sigint=False)
-        try:
-            await runner.run(task)
-        except Exception:  # noqa: BLE001
-            logger.exception("WebRTC pipeline crashed")
-        finally:
-            _dump_metrics(metrics_sink, os.environ.get("METRICS_OUT"))
-
-    # ---- FastAPI app ----------------------------------------------------
-    app = FastAPI()
-
-    @app.get("/")
-    async def index():
-        return HTMLResponse(_WEBRTC_HTML_CLIENT)
-
-    @app.get("/healthz")
-    async def healthz():
-        return JSONResponse({"ok": True})
-
-    @app.post("/api/offer")
-    async def offer(req: SmallWebRTCRequest, background_tasks: BackgroundTasks):
-        async def _cb(conn: SmallWebRTCConnection) -> None:
-            # Spawn the pipeline as a background task so the HTTP response
-            # (the SDP answer) returns immediately. Pipecat's bundled runner
-            # does the same thing with FastAPI's BackgroundTasks.
-            background_tasks.add_task(_run_bot_for_connection, conn)
-
-        answer = await handler.handle_web_request(
-            request=req,
-            webrtc_connection_callback=_cb,
-        )
-        return answer
-
-    logger.info(
-        "WebRTC mode listening on http://{h}:{p}/  (open in a browser via SSH tunnel)",
-        h=host, p=port,
-    )
-
-    config = uvicorn.Config(app, host=host, port=port, log_level="info")
-    server = uvicorn.Server(config)
-    try:
-        await server.serve()
-    finally:
-        await handler.close()
-
-
 async def run() -> None:
     """Build and run the voice pipeline."""
     # Do NOT override shell env: callers (e.g. agents flipping MEGAKERNEL_STUB=1
@@ -969,9 +692,9 @@ async def run() -> None:
     logger.add(sys.stderr, level=os.environ.get("LOG_LEVEL", "INFO"))
 
     input_mode = os.environ.get("INPUT_MODE", "mic").lower()
-    if input_mode not in {"mic", "file", "webrtc"}:
+    if input_mode not in {"mic", "file"}:
         logger.error(
-            "INPUT_MODE must be 'mic', 'file', or 'webrtc', got {m!r}",
+            "INPUT_MODE must be 'mic' or 'file', got {m!r}",
             m=input_mode,
         )
         sys.exit(2)
@@ -1007,10 +730,6 @@ async def run() -> None:
         raise SystemExit(3) from exc
 
     # ---- Context + aggregators -----------------------------------------
-    # For mic/file modes there's only ever one conversation, so we build the
-    # context up front and pass it in. For webrtc mode we hand the per-
-    # connection bot a builder so reconnects start with fresh LLM history
-    # (otherwise turn N+1 from a new browser tab would inherit turn N).
     def _build_context(vad_analyzer):
         ctx = LLMContext()
         aggs = LLMContextAggregatorPair(
@@ -1024,14 +743,11 @@ async def run() -> None:
         m=input_mode, s=stub, sp=speaker,
     )
 
+    context, aggregators = _build_context(SileroVADAnalyzer())
     if input_mode == "mic":
-        context, aggregators = _build_context(SileroVADAnalyzer())
         await _run_mic_mode(stt, llm, tts, context, aggregators)
-    elif input_mode == "file":
-        context, aggregators = _build_context(SileroVADAnalyzer())
+    else:  # file
         await _run_file_mode(stt, llm, tts, context, aggregators)
-    else:  # webrtc
-        await _run_webrtc_mode(stt, llm, tts, _build_context)
 
 
 def main() -> int:

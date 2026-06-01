@@ -1,9 +1,24 @@
-*.bak
+# Python bytecode / compile caches
 __pycache__/
 *.pyc
+*.pyo
+
+# Editor / OS junk
+*.bak
+*.swp
+*.tmp
+.DS_Store
+
+# Vendored upstream clones (read-only references; do not commit)
 pipecat/
 /qwen_megakernel/
 
-# Real env files (NEVER commit)
+# Real env files (NEVER commit secrets)
 .env
 inference-server/.env
+
+# Iterative dev sample outputs — only commit canonical sample WAVs.
+samples/bot_test_iter_*.wav
+samples/bot_response_*.wav
+samples/user_utterance_*.wav
+!samples/bot_response_pipecat.wav

@@ -1,4 +1,6 @@
-# Resume marker — e3 take-home (2026-05-31 03:50 IST)
+# Resume marker — e3 take-home
+
+> **NOTE (2026-06-01)**: The TL;DR table below reflects an EARLIER state (TTFC 35.41 ms / RTF 0.0558 numbers) from the broken-audio era. **See `README.md` for current canonical numbers** (TTFC 23.42 ms / RTF 0.181 with intelligible audio, Deepgram QA-verified at 0.9995-1.000 confidence). This file is kept as a workflow / how-I-worked diary for future-me, not as a numbers source of truth.
 
 > **Start here every new session.** Single source of truth for what's done, what's left, and how to continue.
 

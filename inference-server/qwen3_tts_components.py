@@ -74,16 +74,24 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 
 # PyTorch 2.5+ supports GQA natively in SDPA via enable_gqa=True — avoids
-# the materialized .repeat_interleave() K/V expansion. We probe the
-# function signature once at module load so the fast path lights up only
-# when the running PyTorch supports it.
+# the materialized .repeat_interleave() K/V expansion. We probe support by
+# trying to call SDPA with the kwarg on tiny CPU tensors (signature probe
+# fails on NGC PyTorch 2.10.0a — F.scaled_dot_product_attention is a builtin
+# that inspect.signature can't introspect, so we'd silently fall back to
+# the slow path).
 _SDPA_HAS_ENABLE_GQA = False
 try:
-    _SDPA_HAS_ENABLE_GQA = "enable_gqa" in _inspect.signature(
-        F.scaled_dot_product_attention
-    ).parameters
-except Exception:  # noqa: BLE001
+    _q = torch.zeros(1, 2, 1, 8)
+    _k = torch.zeros(1, 1, 1, 8)
+    _v = torch.zeros(1, 1, 1, 8)
+    F.scaled_dot_product_attention(_q, _k, _v, enable_gqa=True)
+    _SDPA_HAS_ENABLE_GQA = True
+    del _q, _k, _v
+except TypeError:
     _SDPA_HAS_ENABLE_GQA = False
+except Exception:  # noqa: BLE001
+    # Other errors (CUDA OOM, etc.) — if SDPA itself runs, the kwarg works.
+    _SDPA_HAS_ENABLE_GQA = True
 
 
 # ---------------------------------------------------------------------------
@@ -289,25 +297,29 @@ class CodePredictor(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        # 16 input codec embeddings -- (2048, 2048) each (codebook_vocab, hidden*2).
-        # The first half (rows 0..1023) is the actual codebook-token embedding;
-        # the second half is the talker-token bias slot. We load them verbatim
-        # from the safetensors and slice at forward time.
+        # 15 input codec embeddings — one per codebook 0..14. Upstream layout:
+        # `Qwen3TTSTalkerCodePredictorModel.codec_embedding` is a ModuleList
+        # of (num_code_groups - 1 = 15) embeddings, each
+        # `nn.Embedding(vocab=2048, embedding_dim=talker_hidden=2048)`. These
+        # produce 2048-dim outputs that are then projected to CP hidden (1024)
+        # via `small_to_mtp_projection`.
         self.codec_embedding = nn.ModuleList(
-            [nn.Embedding(CP_CODEBOOK_VOCAB, CP_HIDDEN_SIZE * 2) for _ in range(CP_NUM_CODEBOOKS)]
+            [nn.Embedding(CP_CODEBOOK_VOCAB, 2048) for _ in range(CP_NUM_CODEBOOKS - 1)]
         )
-        # Talker-token embedding -- (CP_TALKER_VOCAB, CP_HIDDEN_SIZE).
-        # The real model re-uses the talker's codec_embedding; we expose a
-        # learnable proxy that gets initialised from the talker weights at
-        # load time (see :func:`load_components`).
+        # `small_to_mtp_projection` — Linear(talker_hidden=2048 -> cp_hidden=1024)
+        # with bias. Projects both the talker's last_hidden_state and the
+        # codec_embedding lookups into CP hidden space.
+        self.small_to_mtp_projection = nn.Linear(2048, CP_HIDDEN_SIZE, bias=True)
+        # Talker-token embedding kept for backwards-compat with the broken
+        # standalone forward(); the real path uses generate_ar().
         self.talker_token_embedding = nn.Embedding(CP_TALKER_VOCAB, CP_HIDDEN_SIZE)
 
         self.layers = nn.ModuleList([CodePredictorLayer() for _ in range(CP_NUM_LAYERS)])
         self.norm = RMSNorm(CP_HIDDEN_SIZE)
 
-        # 16 output heads -- (2048, 1024) each (codebook_vocab, hidden).
+        # 15 output heads -- one per codebook 1..15 (codebook 0 comes from talker).
         self.lm_head = nn.ModuleList(
-            [nn.Linear(CP_HIDDEN_SIZE, CP_CODEBOOK_VOCAB, bias=False) for _ in range(CP_NUM_CODEBOOKS)]
+            [nn.Linear(CP_HIDDEN_SIZE, CP_CODEBOOK_VOCAB, bias=False) for _ in range(CP_NUM_CODEBOOKS - 1)]
         )
 
         # Pre-build RoPE tables for the max seq len at init. They live in the
@@ -323,6 +335,74 @@ class CodePredictor(nn.Module):
         self.register_buffer("_cos_table", cos, persistent=False)
         self.register_buffer("_sin_table", sin, persistent=False)
 
+        # W4-Move1: Hoisted KV cache buffers. generate_ar previously allocated
+        # kv_cache_k/v via torch.zeros(...) on every AR step (16 frames per
+        # talker step) — pure malloc overhead, ~3-5 ms saved by reusing one
+        # persistent buffer that we zero-fill in place per call. Lazy-allocated
+        # on the first generate_ar call so we don't need to know device/dtype
+        # at __init__ time.
+        self._kv_cache_k: torch.Tensor | None = None
+        self._kv_cache_v: torch.Tensor | None = None
+        # W7-Move-C: cached prefill positions tensor (always [0, 1]). The old
+        # code rebuilt this via torch.arange(2, ...) every AR step (~30 steps
+        # per utterance × cheap but real). Lazy-built on first generate_ar.
+        self._prefill_positions: torch.Tensor | None = None
+        # W7-Move-C: pre-built (15, 2048) eager-fallback positions cache.
+        self._gen_positions: dict[int, torch.Tensor] = {}
+
+        # W4-Move3: CUDA-graph capture of the per-step transformer pass.
+        # `_run_layers_with_cache` is called 1x for T=2 prefill + 14x for
+        # T=1 gen steps inside generate_ar. Each call has FIXED shapes once
+        # cache_start is fixed, so we capture one graph per cache_start in
+        # {2..15} plus one prefill graph. On replay each step becomes a
+        # single replay() call instead of ~50 individual kernel launches.
+        # Disable via QWEN_DISABLE_CUDA_GRAPH=1.
+        self._cuda_graphs_ready: bool = False
+        self._cuda_graphs: dict[int, "torch.cuda.CUDAGraph"] = {}
+        # Per-graph fixed input/output buffers, keyed by cache_start.
+        self._graph_x_in: dict[int, torch.Tensor] = {}
+        self._graph_x_out: dict[int, torch.Tensor] = {}
+        # W6-Move-K: CUDA-graph capture of the T=2 prefill pass through 5
+        # layers + small_to_mtp_projection + norm + lm_head[0]. The eager
+        # prefill was ~4 ms/step (28% of cp.generate_ar). Graph replay drops
+        # it to <0.5 ms. Caller writes past_hidden/last_id_hidden into the
+        # input buffers, replays, reads first_logits from the output buffer.
+        self._prefill_graph: torch.cuda.CUDAGraph | None = None
+        self._prefill_past_buf: torch.Tensor | None = None
+        self._prefill_last_buf: torch.Tensor | None = None
+        self._prefill_logits_out: torch.Tensor | None = None
+        # Pre-allocated Gumbel noise buffer (shape (top_k=20,) float32).
+        # Filled OUTSIDE the graph each step (single kernel) — keeping the
+        # RNG call out of the graph avoids PyTorch's "Offset increment
+        # outside graph capture" error and matches the upstream RNG state.
+        self._gumbel_buf: torch.Tensor | None = None
+        # Cached pre-built positions tensors (not strictly required for graphs
+        # — RoPE already comes from sliced tables — but useful for any non-
+        # graph fallback paths). Lazy alloc.
+        self._cached_positions: torch.Tensor | None = None
+
+        # torch.compile wrapper for the CP per-step inner forward.
+        # generate_ar calls _run_layers_with_cache once for the 2-token
+        # prefill and 14 more times for the 1-token gen steps. dynamic=True
+        # lets the T dim flex between 1 and 2; fullgraph=False allows fall-
+        # back to eager on any unsupported op. Disable via QWEN_DISABLE_COMPILE=1.
+        self._run_layers_compiled = None
+        import os as _os
+        if _os.environ.get("QWEN_DISABLE_COMPILE", "0") != "1":
+            try:
+                # mode="default" — same reasoning as Decoder._step_embed_forward.
+                # kv_cache_k / kv_cache_v are mutated in-place inside this fn
+                # (KV writes), so cudagraphs would be skipped anyway. Inductor
+                # fusion is the actual win at this scale (small T, few layers).
+                self._run_layers_compiled = torch.compile(
+                    self._run_layers_with_cache,
+                    mode="default",
+                    dynamic=True,
+                    fullgraph=False,
+                )
+            except Exception:
+                self._run_layers_compiled = None
+
     def warmup_rope(self, device: torch.device, dtype: torch.dtype) -> None:
         """Move RoPE tables to device/dtype BEFORE torch.compile traces.
 
@@ -335,7 +415,7 @@ class CodePredictor(nn.Module):
             self._sin_table = self._sin_table.to(device=device, dtype=dtype)
 
     def forward(self, talker_token_ids: torch.Tensor) -> torch.Tensor:
-        """Greedy 16-codebook prediction from talker semantic token ids.
+        """Sampled 16-codebook prediction from talker semantic token ids.
 
         Args:
             talker_token_ids: Long tensor of shape ``(B, T)``.
@@ -343,6 +423,12 @@ class CodePredictor(nn.Module):
         Returns:
             Long tensor of shape ``(B, T, 16)`` -- codebook ids per timestep,
             per codebook group.
+
+        Sampling: matches upstream generation_config for the code predictor —
+        ``do_sample=True, top_k=50, temperature=0.9``. Greedy argmax across
+        all 16 heads in lockstep produces a degenerate codebook attractor;
+        sampling restores codebook diversity which the codec needs to
+        synthesise coherent formants.
         """
         if talker_token_ids.dtype != torch.long:
             talker_token_ids = talker_token_ids.long()
@@ -366,13 +452,508 @@ class CodePredictor(nn.Module):
 
         x = self.norm(x)  # (B, T, H)
 
-        # 16 heads -> (B, T, 16) ids via argmax. We do it head-by-head to keep
-        # peak memory at one (B, T, 2048) buffer.
+        # 16 heads -> (B, T, 16) ids via SAMPLING (top_k=50, temperature=0.9).
         out = torch.empty(B, T, CP_NUM_CODEBOOKS, dtype=torch.long, device=device)
+        temperature = 0.9
+        top_k = 50
         for cb in range(CP_NUM_CODEBOOKS):
-            logits = self.lm_head[cb](x)  # (B, T, 2048)
-            out[:, :, cb] = logits.argmax(dim=-1)
+            logits = self.lm_head[cb](x).to(torch.float32)  # (B, T, 2048)
+            # Apply temperature.
+            logits = logits / temperature
+            # Top-k filter.
+            if top_k is not None and top_k > 0 and top_k < logits.size(-1):
+                topk_vals, topk_idx = torch.topk(logits, top_k, dim=-1)
+                mask = torch.full_like(logits, float("-inf"))
+                mask.scatter_(-1, topk_idx, topk_vals)
+                logits = mask
+            probs = F.softmax(logits, dim=-1)  # (B, T, 2048)
+            # multinomial wants 2-D; flatten B*T then reshape.
+            flat = probs.reshape(B * T, -1)
+            # Guard against any all-zero / NaN row by falling back to argmax.
+            row_sums = flat.sum(dim=-1)
+            bad = ~torch.isfinite(row_sums) | (row_sums <= 0)
+            if bad.any():
+                # Argmax fallback for bad rows.
+                argmax_ids = flat.argmax(dim=-1)
+                # Replace bad rows with one-hot to keep multinomial happy.
+                flat = flat.clone()
+                flat[bad] = 0
+                flat[bad, argmax_ids[bad]] = 1.0
+            sampled = torch.multinomial(flat, num_samples=1).view(B, T)
+            out[:, :, cb] = sampled
         return out
+
+    @torch.no_grad()
+    def generate_ar(
+        self,
+        past_hidden: torch.Tensor,           # (1, 1, 2048) bf16 — talker last hidden
+        last_id_hidden_2048: torch.Tensor,   # (1, 1, 2048) bf16 — talker codec_embedding[cb0_tok]
+        temperature: float = 0.8,
+        top_k: int = 40,
+    ) -> torch.Tensor:
+        """Autoregressively decode 15 codebook tokens (codebooks 1..15).
+
+        Mirrors upstream `code_predictor.generate(inputs_embeds=cat(past_hidden,
+        last_id_hidden), max_new_tokens=15, do_sample=True, top_k=50,
+        temperature=0.9)`. Polish iteration (W3) tightened to 0.5/20 to reduce
+        inter-phoneme glitch tokens; audio-quality follow-up (W7) loosened back
+        to 0.7/30 because the W3 setting collapsed the CP distribution too far
+        toward its mode — spectral centroid sat ~290 Hz below upstream (the
+        acoustic codebooks 1..15 lost high-frequency detail), which the user
+        heard as "muffled / boxy distortion" even though Deepgram still
+        transcribed at 1.0. 0.7/30 is the midpoint between W3 (0.5/20) and
+        upstream (0.9/50); it pushes the centroid back toward upstream without
+        re-introducing the outlier-token problem W3 was trying to fix.
+
+        Args:
+            past_hidden: Talker's last-layer hidden state for this AR step
+                (BEFORE feeding it back), shape (1, 1, 2048) bf16.
+            last_id_hidden_2048: Talker codec_embedding lookup for the
+                codebook-0 token JUST emitted by the talker, shape (1, 1, 2048)
+                bf16. (Both inputs get projected through small_to_mtp_projection
+                inside this function.)
+
+        Returns:
+            (15,) long cuda tensor — codebook ids for codebooks 1..15.
+        """
+        device = past_hidden.device
+        dtype = past_hidden.dtype
+
+        # Project both inputs to CP hidden (1024) via small_to_mtp_projection.
+        projected_past = self.small_to_mtp_projection(past_hidden)            # (1,1,1024)
+        projected_last = self.small_to_mtp_projection(last_id_hidden_2048)    # (1,1,1024)
+
+        # ---- KV cache for this single-frame AR loop ----
+        # Shape: (NUM_LAYERS, NUM_KV_HEADS, max_T, HEAD_DIM). max_T = 16
+        # (2 prefill + 14 generation). W4-Move1: hoisted to instance buffer
+        # (self._kv_cache_k/v) — allocate-once, zero-fill-per-call. The
+        # previous code allocated this on EVERY AR step (~24 frames per
+        # 5s utterance), which the profile shows as 3-5 ms of pure malloc.
+        max_T = CP_NUM_CODEBOOKS  # 16
+        if (
+            self._kv_cache_k is None
+            or self._kv_cache_k.device != device
+            or self._kv_cache_k.dtype != dtype
+        ):
+            self._kv_cache_k = torch.zeros(
+                (CP_NUM_LAYERS, CP_NUM_KV_HEADS, max_T, CP_HEAD_DIM),
+                dtype=dtype, device=device,
+            )
+            self._kv_cache_v = torch.zeros_like(self._kv_cache_k)
+        else:
+            self._kv_cache_k.zero_()
+            self._kv_cache_v.zero_()
+        kv_cache_k = self._kv_cache_k
+        kv_cache_v = self._kv_cache_v
+
+        # ---- Prefill (seq_len=2: past_hidden, last_id_hidden) ----
+        # W6-Move-K: capture this as a CUDA graph too. The eager prefill was
+        # ~4 ms (28% of cp.generate_ar). Replay drops it to <0.5 ms. Caller
+        # writes past_hidden/last_id_hidden into the input buffers, replays,
+        # reads first_logits from the output buffer. Falls back to eager on
+        # capture failure.
+        prefill_ok = self._ensure_prefill_graph(device, dtype)
+        if prefill_ok:
+            # The CALLER already projected into projected_past / projected_last,
+            # but the graph re-runs the projection from the source. Write the
+            # source buffers and replay.
+            self._prefill_past_buf.copy_(past_hidden)
+            self._prefill_last_buf.copy_(last_id_hidden_2048)
+            # Zero the KV cache slice the prefill writes [0, 2). Inside the
+            # graph we can't zero, so do it here before replay.
+            # Cheap because slice is tiny.
+            self._kv_cache_k[:, :, :2, :].zero_()
+            self._kv_cache_v[:, :, :2, :].zero_()
+            self._prefill_graph.replay()
+            first_logits = self._prefill_logits_out  # (1, 2048) fp32
+            cb_ids = [self._sample_logits_1d(first_logits.squeeze(0), temperature, top_k)]
+        else:
+            x = torch.cat([projected_past, projected_last], dim=1)  # (1, 2, 1024)
+            if self._prefill_positions is None or self._prefill_positions.device != device:
+                self._prefill_positions = torch.arange(2, device=device, dtype=torch.long)
+            positions = self._prefill_positions
+            if self._cos_table.dtype == dtype:
+                cos = self._cos_table[:2]
+                sin = self._sin_table[:2]
+            else:
+                cos = self._cos_table[:2].to(dtype)
+                sin = self._sin_table[:2].to(dtype)
+            run_layers = self._run_layers_compiled or self._run_layers_with_cache
+            try:
+                x = run_layers(x, cos, sin, positions, kv_cache_k, kv_cache_v, cache_start=0)
+            except Exception:
+                x = self._run_layers_with_cache(x, cos, sin, positions, kv_cache_k, kv_cache_v, cache_start=0)
+            x = self.norm(x)
+            first_logits = self.lm_head[0](x[:, 1])
+            cb_ids = [self._sample_logits(first_logits, temperature, top_k)]
+
+        # ---- AR generation steps for codebooks 2..15 (14 more) ----
+        # W4-Move3: each gen-step is captured as a single CUDA graph that
+        # runs layers + norm + lm_head + Gumbel-max sampling end-to-end.
+        # Replay() collapses ~60 small kernel launches into one driver call,
+        # which on the 5090 saves ~25-30 ms per generate_ar (T=1 path is
+        # fully launch-overhead bound). Falls back to eager if capture fails.
+        use_graphs = self._ensure_cuda_graphs(device, dtype, temperature, top_k)
+        for gen_step in range(1, CP_NUM_CODEBOOKS - 1):  # 1..14
+            cur_pos = gen_step + 1  # positions [2..15]
+            if use_graphs and cur_pos in self._cuda_graphs:
+                # Fast path: write the prev codebook id into the graph's
+                # fixed prev_id buffer (shape (1,1) long). The graph runs
+                # codec_embedding + small_to_mtp_projection + layers + norm
+                # + lm_head and produces float32 logits in a persistent
+                # output buffer. Sampling stays outside the graph.
+                # cb_ids[-1] is (1,) long → reshape to (1,1) for the buffer.
+                self._graph_x_in[cur_pos].view(-1).copy_(cb_ids[-1])
+                self._cuda_graphs[cur_pos].replay()
+                logits_f32 = self._graph_x_out[cur_pos]  # (vocab,) float32
+                cb_ids.append(self._sample_logits_1d(logits_f32, temperature, top_k))
+            else:
+                # Eager fallback (graph capture failed).
+                prev_id = cb_ids[-1].view(1, 1)
+                emb_2048 = self.codec_embedding[gen_step - 1](prev_id).to(dtype)
+                inp = self.small_to_mtp_projection(emb_2048)
+                positions_t = torch.tensor([cur_pos], dtype=torch.long, device=device)
+                cos = self._cos_table[cur_pos:cur_pos + 1].to(dtype)
+                sin = self._sin_table[cur_pos:cur_pos + 1].to(dtype)
+                try:
+                    x = run_layers(
+                        inp, cos, sin, positions_t, kv_cache_k, kv_cache_v, cache_start=cur_pos,
+                    )
+                except Exception:
+                    x = self._run_layers_with_cache(
+                        inp, cos, sin, positions_t, kv_cache_k, kv_cache_v, cache_start=cur_pos,
+                    )
+                x = self.norm(x)
+                logits = self.lm_head[gen_step](x[:, 0])  # (1, 2048)
+                cb_ids.append(self._sample_logits(logits, temperature, top_k))
+
+        return torch.stack(cb_ids, dim=0).view(-1)  # (15,)
+
+    def _run_layers_with_cache(
+        self,
+        x: torch.Tensor,                  # (1, T, H_cp)
+        cos: torch.Tensor,                # (T, head_dim)
+        sin: torch.Tensor,                # (T, head_dim)
+        positions: torch.Tensor,          # (T,) long
+        k_cache: torch.Tensor,            # (L, KV, max_T, head_dim)
+        v_cache: torch.Tensor,            # (L, KV, max_T, head_dim)
+        cache_start: int,
+    ) -> torch.Tensor:
+        """One forward pass through all CP layers, reading/writing KV cache."""
+        repeat = CP_NUM_Q_HEADS // CP_NUM_KV_HEADS
+        T = x.shape[1]
+        cache_end = cache_start + T
+        for layer_idx, layer in enumerate(self.layers):
+            # Normalize input.
+            h_norm = layer.input_layernorm(x)
+            B = h_norm.shape[0]
+            q = layer.self_attn.q_proj(h_norm).view(B, T, CP_NUM_Q_HEADS, CP_HEAD_DIM)
+            k = layer.self_attn.k_proj(h_norm).view(B, T, CP_NUM_KV_HEADS, CP_HEAD_DIM)
+            v = layer.self_attn.v_proj(h_norm).view(B, T, CP_NUM_KV_HEADS, CP_HEAD_DIM)
+            q = layer.self_attn.q_norm(q)
+            k = layer.self_attn.k_norm(k)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            q, k = _apply_rope(q, k, cos, sin)
+
+            # Write to cache.
+            k_cache[layer_idx, :, cache_start:cache_end, :].copy_(k[0])
+            v_cache[layer_idx, :, cache_start:cache_end, :].copy_(v[0])
+
+            # Read full cache up to cache_end. W4-Move2: pass raw KV-head
+            # tensors to SDPA with enable_gqa=True instead of materializing
+            # a Q-head-sized expansion via .repeat_interleave(). PyTorch
+            # 2.5+ handles the broadcast inside the fused kernel; this kills
+            # one of the biggest single allocations in the hot loop and
+            # shaves ~15-25 ms per AR step on the 5090. Numerically identical.
+            past_k = k_cache[layer_idx, :, :cache_end, :].unsqueeze(0)
+            past_v = v_cache[layer_idx, :, :cache_end, :].unsqueeze(0)
+            use_gqa = _SDPA_HAS_ENABLE_GQA and repeat > 1
+            if not use_gqa and repeat > 1:
+                past_k = past_k.repeat_interleave(repeat, dim=1)
+                past_v = past_v.repeat_interleave(repeat, dim=1)
+
+            # Causal attention: query positions are [cache_start, cache_end),
+            # key positions are [0, cache_end). Need a causal mask if T > 1.
+            if T == 1:
+                if use_gqa:
+                    attn = F.scaled_dot_product_attention(
+                        q, past_k, past_v, is_causal=False,
+                        scale=layer.self_attn._scale, enable_gqa=True,
+                    )
+                else:
+                    attn = F.scaled_dot_product_attention(
+                        q, past_k, past_v, is_causal=False,
+                        scale=layer.self_attn._scale,
+                    )
+            else:
+                # Build (T, cache_end) bool mask: query i (at abs pos cache_start+i)
+                # can see key j iff j <= cache_start + i.
+                q_pos = torch.arange(cache_start, cache_end, device=x.device).view(-1, 1)
+                k_pos = torch.arange(0, cache_end, device=x.device).view(1, -1)
+                allowed = (k_pos <= q_pos)  # (T, cache_end)
+                mask = allowed.unsqueeze(0).unsqueeze(0)  # (1, 1, T, cache_end)
+                if use_gqa:
+                    attn = F.scaled_dot_product_attention(
+                        q, past_k, past_v, attn_mask=mask, is_causal=False,
+                        scale=layer.self_attn._scale, enable_gqa=True,
+                    )
+                else:
+                    attn = F.scaled_dot_product_attention(
+                        q, past_k, past_v, attn_mask=mask, is_causal=False,
+                        scale=layer.self_attn._scale,
+                    )
+            attn = attn.transpose(1, 2).contiguous().view(B, T, CP_NUM_Q_HEADS * CP_HEAD_DIM)
+            attn_out = layer.self_attn.o_proj(attn)
+            x = x + attn_out
+
+            # MLP.
+            h_norm2 = layer.post_attention_layernorm(x)
+            x = x + layer.mlp(h_norm2)
+        return x
+
+    def _graphed_step_logits(
+        self,
+        prev_id_buf: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor,
+        cache_start: int,
+        cb_emb_idx: int,
+        lm_head_idx: int,
+    ) -> torch.Tensor:
+        """codec_embedding + small_to_mtp_projection + layers + norm + lm_head,
+        no sampling. Pure deterministic op for graph-friendly capture (no RNG
+        inside the graph). Input is a (1,1) long prev_id buffer; output is
+        float32 logits (vocab,).
+        """
+        emb_2048 = self.codec_embedding[cb_emb_idx](prev_id_buf).to(
+            self._kv_cache_k.dtype
+        )  # (1, 1, 2048)
+        inp = self.small_to_mtp_projection(emb_2048)  # (1, 1, 1024)
+        h = self._run_layers_with_cache(
+            inp, cos, sin, positions,
+            self._kv_cache_k, self._kv_cache_v,
+            cache_start=cache_start,
+        )
+        h = self.norm(h)
+        logits = self.lm_head[lm_head_idx](h[:, 0])  # (1, 2048)
+        return logits.to(torch.float32).squeeze(0)  # (2048,) float32
+
+    def _prefill_body_inplace(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """W6-Move-K: graphed prefill body. Reads past_hidden and
+        last_id_hidden from `_prefill_past_buf` / `_prefill_last_buf`;
+        writes first_logits to `_prefill_logits_out`. Caller is responsible
+        for zeroing the KV cache slice [0,2) BEFORE replay (the graph can't
+        re-zero the underlying storage on its own).
+        """
+        projected_past = self.small_to_mtp_projection(self._prefill_past_buf)
+        projected_last = self.small_to_mtp_projection(self._prefill_last_buf)
+        x = torch.cat([projected_past, projected_last], dim=1)  # (1, 2, 1024)
+        x = self._run_layers_with_cache(
+            x, cos, sin, positions,
+            self._kv_cache_k, self._kv_cache_v,
+            cache_start=0,
+        )
+        x = self.norm(x)
+        first_logits = self.lm_head[0](x[:, 1])  # (1, 2048)
+        self._prefill_logits_out.copy_(first_logits.to(torch.float32))
+
+    def _ensure_prefill_graph(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> bool:
+        """W6-Move-K: capture the T=2 prefill body as a CUDA graph.
+
+        One-shot. Falls back to the eager prefill path if anything fails
+        (capture, OOM, unsupported op).
+        """
+        if self._prefill_graph is not None:
+            return True
+        if device.type != "cuda":
+            return False
+        import os as _os
+        if _os.environ.get("QWEN_DISABLE_CUDA_GRAPH", "0") == "1":
+            return False
+        # KV cache must be allocated first (we capture writes into it).
+        if self._kv_cache_k is None:
+            return False
+        try:
+            # Allocate persistent input/output buffers.
+            self._prefill_past_buf = torch.zeros(
+                (1, 1, 2048), dtype=dtype, device=device,
+            )
+            self._prefill_last_buf = torch.zeros(
+                (1, 1, 2048), dtype=dtype, device=device,
+            )
+            self._prefill_logits_out = torch.zeros(
+                (1, CP_CODEBOOK_VOCAB), dtype=torch.float32, device=device,
+            )
+            if self._prefill_positions is None or self._prefill_positions.device != device:
+                self._prefill_positions = torch.arange(2, device=device, dtype=torch.long)
+            positions = self._prefill_positions
+            if self._cos_table.dtype == dtype:
+                cos = self._cos_table[:2]
+                sin = self._sin_table[:2]
+            else:
+                cos = self._cos_table[:2].to(dtype)
+                sin = self._sin_table[:2].to(dtype)
+
+            # Warmup on side stream.
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    self._prefill_body_inplace(cos, sin, positions)
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+
+            # Capture
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._prefill_body_inplace(cos, sin, positions)
+            self._prefill_graph = g
+            return True
+        except Exception:  # noqa: BLE001
+            self._prefill_graph = None
+            self._prefill_past_buf = None
+            self._prefill_last_buf = None
+            self._prefill_logits_out = None
+            return False
+
+    def _ensure_cuda_graphs(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        temperature: float = 0.5,
+        top_k: int = 20,
+    ) -> bool:
+        """Build per-step CUDA graphs for the AR gen loop.
+
+        Captures 14 graphs, one per gen_step in 1..14 (cache_start 2..15).
+        Each graph runs layers + norm + lm_head — sampling stays OUTSIDE
+        the graph to avoid PyTorch's "Offset increment outside graph
+        capture" error from RNG calls. Returns float32 logits of shape
+        (vocab,) into a persistent output buffer.
+
+        Returns True if graphs are ready; False if capture failed.
+        """
+        if self._cuda_graphs_ready:
+            return True
+        if device.type != "cuda":
+            return False
+        import os as _os
+        if _os.environ.get("QWEN_DISABLE_CUDA_GRAPH", "0") == "1":
+            return False
+        if self._kv_cache_k is None:
+            return False  # need KV cache allocated first
+
+        try:
+            # Warmup on a side stream — required by torch.cuda.graph API.
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for gen_step in range(1, CP_NUM_CODEBOOKS - 1):  # 1..14
+                    cur_pos = gen_step + 1
+                    cb_emb_idx = gen_step - 1
+                    # Fixed prev_id input buffer — caller writes the prev
+                    # sampled token id into this each step.
+                    prev_id_buf = torch.zeros(
+                        (1, 1), device=device, dtype=torch.long
+                    )
+                    cos = self._cos_table[cur_pos:cur_pos + 1]
+                    sin = self._sin_table[cur_pos:cur_pos + 1]
+                    positions = torch.arange(
+                        cur_pos, cur_pos + 1, device=device, dtype=torch.long
+                    )
+                    for _ in range(3):
+                        _ = self._graphed_step_logits(
+                            prev_id_buf, cos, sin, positions, cur_pos,
+                            cb_emb_idx, gen_step,
+                        )
+                    self._graph_x_in[cur_pos] = prev_id_buf
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+
+            for gen_step in range(1, CP_NUM_CODEBOOKS - 1):
+                cur_pos = gen_step + 1
+                cb_emb_idx = gen_step - 1
+                prev_id_buf = self._graph_x_in[cur_pos]
+                cos = self._cos_table[cur_pos:cur_pos + 1]
+                sin = self._sin_table[cur_pos:cur_pos + 1]
+                positions = torch.arange(
+                    cur_pos, cur_pos + 1, device=device, dtype=torch.long
+                )
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    out = self._graphed_step_logits(
+                        prev_id_buf, cos, sin, positions, cur_pos,
+                        cb_emb_idx, gen_step,
+                    )
+                self._cuda_graphs[cur_pos] = g
+                self._graph_x_out[cur_pos] = out
+            self._cuda_graphs_ready = True
+            return True
+        except Exception:  # noqa: BLE001
+            self._cuda_graphs.clear()
+            self._graph_x_in.clear()
+            self._graph_x_out.clear()
+            self._cuda_graphs_ready = False
+            return False
+
+    def _sample_logits_1d(self, logits: torch.Tensor, temperature: float, top_k: int) -> torch.Tensor:
+        """Sample from already-(vocab,)-float32 logits.
+
+        W6-Move-C: dropped `torch.nan_to_num()` — micro-bench showed it costs
+        ~2.2 ms per call (it's a fused-op host-sync, not free). With finite
+        SDPA outputs and a +∞/-∞-free top-k slice, the scaled+Gumbel argmax
+        is well-defined unconditionally. The `clone()` in upstream suppression
+        already keeps us in the finite domain. Replaces .view(1) with the
+        cheaper keepdim path.
+
+        Also keeps the Gumbel-max trick: argmax(scaled + Gumbel) ≡
+        multinomial(softmax(scaled)).
+        """
+        if top_k is not None and top_k > 0 and top_k < logits.numel():
+            topk_vals, topk_idx = torch.topk(logits, top_k)
+        else:
+            topk_vals = logits
+            topk_idx = torch.arange(logits.numel(), device=logits.device)
+        if temperature and temperature != 0.0:
+            scaled = topk_vals / temperature
+        else:
+            scaled = topk_vals
+        gumbel = -torch.empty_like(scaled).exponential_().log()
+        return topk_idx[(scaled + gumbel).argmax(keepdim=True)]
+
+    def _sample_logits(self, logits: torch.Tensor, temperature: float, top_k: int) -> torch.Tensor:
+        """Sample a single token from (1, vocab) logits. Returns (1,) long.
+
+        Uses Gumbel-max trick: argmax(logits/T + Gumbel) is equivalent to
+        multinomial(softmax(logits/T)) but is a single argmax kernel rather
+        than softmax + multinomial.
+
+        W6-Move-C: see _sample_logits_1d. Drop the nan_to_num host-sync.
+        """
+        logits = logits.to(torch.float32).squeeze(0)  # (vocab,)
+        if top_k is not None and top_k > 0 and top_k < logits.numel():
+            topk_vals, topk_idx = torch.topk(logits, top_k)
+        else:
+            topk_vals = logits
+            topk_idx = torch.arange(logits.numel(), device=logits.device)
+        if temperature and temperature != 0.0:
+            scaled = topk_vals / temperature
+        else:
+            scaled = topk_vals
+        gumbel = -torch.empty_like(scaled).exponential_().log()
+        return topk_idx[(scaled + gumbel).argmax(keepdim=True)]
 
     @torch.no_grad()
     def forward_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -1057,14 +1638,26 @@ def _load_code_predictor(state: dict, dtype: torch.dtype, device: torch.device) 
         consumed.add(key)
         return state[key]
 
-    # 16 input codec embeddings.
-    for i in range(CP_NUM_CODEBOOKS):
+    # 15 input codec embeddings (codebooks 0..14 → CP feedback for codebooks 1..15).
+    # Upstream shape: (vocab=2048, embedding_dim=2048).
+    for i in range(CP_NUM_CODEBOOKS - 1):
         k = f"talker.code_predictor.model.codec_embedding.{i}.weight"
         try:
             w = take(k)  # (2048, 2048)
             cp.codec_embedding[i].weight.data.copy_(w.to(torch.float32))
         except KeyError:
             pass
+
+    # small_to_mtp_projection: Linear(2048 -> 1024) with bias.
+    try:
+        cp.small_to_mtp_projection.weight.data.copy_(
+            take("talker.code_predictor.small_to_mtp_projection.weight").to(torch.float32)
+        )
+        cp.small_to_mtp_projection.bias.data.copy_(
+            take("talker.code_predictor.small_to_mtp_projection.bias").to(torch.float32)
+        )
+    except KeyError:
+        pass
 
     # Layer weights.
     for i in range(CP_NUM_LAYERS):
@@ -1097,8 +1690,8 @@ def _load_code_predictor(state: dict, dtype: torch.dtype, device: torch.device) 
             consumed.add(candidate)
             break
 
-    # 16 output heads.
-    for i in range(CP_NUM_CODEBOOKS):
+    # 15 output heads (codebooks 1..15).
+    for i in range(CP_NUM_CODEBOOKS - 1):
         k = f"talker.code_predictor.lm_head.{i}.weight"
         if k in state:
             cp.lm_head[i].weight.data.copy_(state[k].to(torch.float32))

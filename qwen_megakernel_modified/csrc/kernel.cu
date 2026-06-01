@@ -1311,6 +1311,7 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
 
 __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
     const __nv_bfloat16 *__restrict__ embed_weight,
+    const __nv_bfloat16 *__restrict__ input_embed,  // E3-PATH-2: nullable; when non-null, used directly as layer-0 input instead of embed_weight[input_token_id]. Lets the Qwen3-TTS AR loop feed a precomputed CP-summed + text-trailing embedding into the megakernel.
     const LDGLayerWeights *__restrict__ layer_weights,
     const __nv_bfloat16 *__restrict__ final_norm_weight,
     const __nv_bfloat16 *__restrict__ cos_table,
@@ -1356,7 +1357,14 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
   AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
                       1};
 
-  const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+  // E3-PATH-2: route the layer-0 input through either the embed-table lookup
+  // (token-id path — used by bench_megakernel.py and qwen_megakernel/bench.py)
+  // or the precomputed input embedding (Qwen3-TTS AR loop — CP-summed +
+  // trailing-text). Branch is uniform across blocks/threads so no warp
+  // divergence at this point.
+  const __nv_bfloat16 *embed_row = (input_embed != nullptr)
+      ? input_embed
+      : (embed_weight + input_token_id * HIDDEN_SIZE);
 
   int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
 
@@ -1487,7 +1495,9 @@ extern "C" void launch_ldg_decode_direct(
   ensure_barrier_alloc();
 
   ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
-      (const __nv_bfloat16 *)embed_weight, layer_weights,
+      (const __nv_bfloat16 *)embed_weight,
+      /* input_embed = */ nullptr,  // E3-PATH-2: token-id path; embed_weight[input_token_id] used.
+      layer_weights,
       (const __nv_bfloat16 *)final_norm_weight,
       (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
       (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
@@ -1502,6 +1512,48 @@ extern "C" void launch_ldg_decode_direct(
       (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
       (float *)block_max_vals, (int *)block_max_idxs, output_token_id,
       d_lm_head_counter, LDG_LM_NUM_BLOCKS);
+}
+
+// E3-PATH-2: precomputed-embedding entry point for the Qwen3-TTS AR loop.
+// Runs the same megakernel body as launch_ldg_decode_direct, but:
+//   (a) reads the layer-0 input from `input_embed` (bf16, HIDDEN) instead of
+//       embed_weight[input_token_id] — required because the TTS step input is
+//       `last_id_hidden + Σ codec_embedding[i](cb_preds[i]) + trailing_text`,
+//       not a raw token-id embedding lookup.
+//   (b) DOES NOT launch ldg_lm_head_fused. Caller reads `g_normalized` (the
+//       fp32 last_hidden after final RMSNorm), runs lm_head in PyTorch, and
+//       applies the full custom sampling tail (rep-penalty + suppress mask +
+//       top-k + Gumbel) which can't live inside the kernel.
+// Same launch geometry (LDG_NUM_BLOCKS × LDG_BLOCK_SIZE) as the existing
+// direct path — all the SM occupancy / shared-memory carveout / KV-cache
+// state is shared with the token-id path.
+extern "C" void launch_ldg_decode_direct_embed(
+    const void *embed_weight,  // pass-through; ignored when input_embed != nullptr but kept to preserve the kernel signature.
+    const void *input_embed,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized,
+    int num_layers, int position, int max_seq_len, float attn_scale,
+    cudaStream_t stream) {
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
+
+  ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+      (const __nv_bfloat16 *)embed_weight,
+      (const __nv_bfloat16 *)input_embed,
+      layer_weights,
+      (const __nv_bfloat16 *)final_norm_weight,
+      (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
+      (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
+      (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
+      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
+      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+      position, /* input_token_id = */ 0, max_seq_len, attn_scale);
+
+  // Intentionally NOT calling ldg_lm_head_fused — caller handles lm_head + sampling.
 }
 
 extern "C" void launch_ldg_decode_persistent(

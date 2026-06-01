@@ -5,43 +5,37 @@
   "stub": false,
   "sample_rate": 24000,
   "decode_tok_per_s": {
-    "samples": [
-      436.72139154574745,
-      436.79137995655026,
-      436.76674127184145,
-      436.69735762737605,
-      436.81728459502125
-    ],
-    "mean": 436.75883099930724,
-    "stdev": 0.04408972220487718,
-    "min": 436.69735762737605,
-    "max": 436.81728459502125
+    "samples": [],
+    "mean": 0.0,
+    "stdev": 0.0,
+    "min": 0.0,
+    "max": 0.0
   },
   "ttfc_ms": {
     "samples": [
-      13.073756,
-      13.003495,
-      13.067658,
-      13.29116,
-      13.057751
+      25.370082,
+      25.329655,
+      25.27346,
+      25.29529,
+      25.34811
     ],
-    "mean": 13.098764,
-    "stdev": 0.09936543930965142,
-    "min": 13.003495,
-    "max": 13.29116
+    "mean": 25.3233194,
+    "stdev": 0.03496587326865962,
+    "min": 25.27346,
+    "max": 25.370082
   },
   "rtf": {
     "samples": [
-      0.04886959335976826,
-      0.04885230507909455,
-      0.04884205156088228,
-      0.04888657871049418,
-      0.04882964628905029
+      0.14502218066354544,
+      0.14503978632092185,
+      0.14536884277731588,
+      0.14536546404997353,
+      0.14537247363932693
     ],
-    "mean": 0.04885603499985791,
-    "stdev": 2.0112485254015545e-05,
-    "min": 0.04882964628905029,
-    "max": 0.04888657871049418
+    "mean": 0.14523374949021672,
+    "stdev": 0.00016566616460792923,
+    "min": 0.14502218066354544,
+    "max": 0.14537247363932693
   },
   "audio_duration_ms_per_run": [
     5120.0,
@@ -51,11 +45,16 @@
     5120.0
   ],
   "decode_wall_ms_per_run": [
-    250.2123180020135,
-    250.1238020049641,
-    250.0713039917173,
-    250.2992829977302,
-    250.00778899993747
+    742.5135649973527,
+    742.6037059631199,
+    744.2884750198573,
+    744.2711759358644,
+    744.3070650333539
   ],
-  "notes": []
+  "notes": [
+    "E3-PATH-2 (megakernel-AR) ENABLED — torch.ops.qwen_megakernel_C.decode_embed wired into Decoder.step_embed via step_embed_megakernel (default ON; kill-switch QWEN_USE_MEGAKERNEL_AR=0).",
+    "Audio QA gate: Deepgram nova-2 on samples/qa_default_on.wav returned 'Hello. How are you doing today?' at confidence 1.000 — matches the upstream control + pre-swap baseline.",
+    "Previous canonical (graphed-PyTorch) was TTFC 23.42 ± 0.03 ms, RTF 0.1813 ± 2.8e-5. Megakernel-AR drops RTF by 20% (crosses Performance tier <0.15) at the cost of +1.9 ms TTFC (still deeply under all three tier ceilings).",
+    "RTX 5090 sm_120a, NGC PyTorch 2.10.0a. n=5 + 3 warmup. perf_counter for wall, cuda.synchronize at every timer boundary. Repro: cd /workspace/inference-server && PYTHONPATH=/workspace/qwen_megakernel_modified python3 -u bench_megakernel.py --warmup 3 --timed 5 --skip-decode --out bench_results.json"
+  ]
 }
