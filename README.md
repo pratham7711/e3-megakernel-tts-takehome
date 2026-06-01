@@ -8,7 +8,12 @@
 - **RTF: 0.1452 ± 1.7e-4** — passes Performance + Deliverables ✓✓ (misses Tightest by 0.045)
 - **Audio QA: Deepgram nova-2 round-trip = 1.000 confidence**, matches the vanilla upstream Qwen3-TTS control (0.9995) on the same GPU.
 
-Deep dive (process, tradeoffs, per-step decomposition explaining the Tightest miss): **[`ENGINEERING_NOTES.md`](./ENGINEERING_NOTES.md)**. Diff-level changelog: **[`CHANGELOG.md`](./CHANGELOG.md)**. Demo: <https://www.loom.com/share/7768e549803c4a3a8678e4a5f39d996b>.
+**Further reading** (each is self-contained):
+- **[`SETUP_AND_TESTING.md`](./SETUP_AND_TESTING.md)** — full reproducibility walkthrough (prerequisites → bench → demo → audio QA → troubleshooting)
+- **[`BENCHMARK_REPORT.md`](./BENCHMARK_REPORT.md)** — honest measurement report (methodology, per-component decomposition, tier analysis, audio QA, statistical breakdown, every assumption named)
+- **[`ENGINEERING_NOTES.md`](./ENGINEERING_NOTES.md)** — process narrative + 7 explicit tradeoffs + why we miss Tightest tier
+- **[`CHANGELOG.md`](./CHANGELOG.md)** — chronological diff with bench numbers per landed change
+- **Demo (~3 min)**: <https://www.loom.com/share/7768e549803c4a3a8678e4a5f39d996b>
 
 ---
 
