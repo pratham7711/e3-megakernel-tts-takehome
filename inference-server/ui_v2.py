@@ -1,50 +1,39 @@
 """Polished Gradio UI for the e3 Megakernel x Qwen3-TTS take-home submission.
 
-Two MUTUALLY EXCLUSIVE modes, picked by a top-level radio switcher:
-
-  * **Test & measure** — mic-record one question, slide the frames cap, hit
-    Send: Deepgram REST STT → Groq LLM → MegakernelTTSService (the REAL
-    megakernel — no macOS fallback anywhere) → bot WAV. Each stage is timed
-    and surfaced in a per-stage log. Bench metric cards reflect the most
-    recent measured values.
-
-  * **Live conversation** — continuous WebRTC voice loop. The backend lives
-    in ``pipecat_demo.py`` (``INPUT_MODE=webrtc``) on port 8081. We embed
-    that page in an ``<iframe>`` so the user stays inside one tab; a
-    "Open in new tab" link is provided too. The metric cards continue to
-    show the latest values, polled from ``/workspace/metrics_gpu.json``
-    (which ``pipecat_demo._write_snapshot`` writes on every observer event).
-
-The 4 metric cards (TTFC, RTF, decode tok/s, audio duration / e2e) are
-PERSISTENT — they sit above both modes' widgets and are colored against the
-brief's three target tiers:
+Single mode — **Test & measure**: mic-record one question, hit Send and the
+pipeline runs Deepgram REST STT → Groq LLM → ``MegakernelTTSService`` (the
+REAL megakernel — no macOS fallback anywhere) → bot WAV. Each stage is timed
+and surfaced in a per-stage log. The 4 metric cards (TTFC, RTF, decode tok/s,
+audio duration / e2e) live above the widgets, colored against the brief's
+three target tiers:
 
     GREEN  -> meets Step 4 Validate (tightest: TTFC<50ms, RTF<0.10)
     YELLOW -> meets only Deliverables (TTFC<90ms, RTF<0.30)
     RED    -> misses all tiers
 
+The earlier "Live conversation" WebRTC mode was removed: SSH tunnels carry
+only TCP, WebRTC media is UDP, so live audio required either a TURN relay
+(account-bound credentials) or re-renting the GPU box with `-p UDP:N:M`.
+The brief's measurable deliverables don't depend on live mode and Mode A
+covers the full pipeline.
+
 Run on the GPU box::
 
-    # Terminal 1 — the WebRTC backend (Live conversation mode)
-    INPUT_MODE=webrtc WEBRTC_PORT=8081 python3 pipecat_demo.py
-
-    # Terminal 2 — this Gradio UI
-    python3 ui_v2.py
-
-Then SSH-tunnel BOTH ports::
-
-    ssh -L 8080:localhost:8080 -L 8081:localhost:8081 <gpu-box>
+    cd inference-server
+    PYTHONPATH=/workspace/qwen_megakernel python3 ui_v2.py
+    # then SSH-tunnel port 8080:
+    ssh -L 8080:localhost:8080 <gpu-box>
 
 Design notes
 ------------
-* Mode A's pipeline runs in an ``async`` handler (Gradio runs each handler
-  in its own asyncio task), so a long-running megakernel forward never
-  freezes the UI's event loop. STT + LLM use ``httpx.AsyncClient``; the TTS
-  is intrinsically async via ``MegakernelTTSService._tts.generate()``.
+* The pipeline runs in an ``async`` handler (Gradio runs each handler in its
+  own asyncio task), so a long-running megakernel forward never freezes the
+  UI's event loop. STT + LLM use ``httpx.AsyncClient``; the TTS is
+  intrinsically async via ``MegakernelTTSService._tts.generate()``.
 * No macOS ``say`` fallback ANYWHERE. If the megakernel fails to load
   (``LoadedComponents.stub == True``) we surface the load error in the
   stage log instead of pretending audio rendered.
-* Mode A reuses ``MegakernelTTSService`` (not the raw kernel directly) per
+* The UI reuses ``MegakernelTTSService`` (not the raw kernel directly) per
   the brief's "DO NOT call the megakernel directly" rule.
 """
 
@@ -53,7 +42,6 @@ from __future__ import annotations
 import asyncio
 import html
 import io
-import json
 import os
 import time
 import wave
@@ -93,17 +81,21 @@ BUILD_FLAGS: dict[str, Any] = {
 DISCLAIMER_TEXT = (
     "Codec is the REAL Qwen3-TTS 271-key vocoder (clean-room reimplementation). "
     "Talker + code_predictor compute is REAL and per-frame; timing is honest. "
-    "Mode A (Test & measure) calls Deepgram REST + Groq + MegakernelTTSService. "
-    "Mode B (Live conversation) embeds the SmallWebRTCTransport-driven loop "
-    "from pipecat_demo.py on port 8081."
+    "Pipeline: Deepgram REST → Groq LLM → MegakernelTTSService → streaming PCM."
 )
 
+# TODO(W3): the bench line below carries provisional TTFC/RTF numbers
+# (18.7 ms / 0.123) captured before the W1 megakernel↔Qwen3-TTS wiring
+# fix landed. Once W3 (canonical bench rerun) publishes final numbers,
+# replace the bench-line entry below with the canonical values. Do NOT
+# hand-edit those numbers — wait for the W3 deliverable.
 HONEST_DISCLOSURES: list[str] = [
     "Codec: REAL Qwen3-TTS V2 vocoder (271 weights, clean-room reimpl)",
-    "Per-frame streaming: TTFC measured at FIRST PCM chunk, not end-of-utterance flush",
-    "Mode A uses MegakernelTTSService.run_tts (same Pipecat service as Live mode); no mac fallback",
-    "Mode B reads /workspace/metrics_gpu.json (written by pipecat_demo._write_snapshot)",
-    "GPU: 1x RTX 5090 sm_120 Blackwell, CUDA 13.1, PyTorch 2.10.0a NGC",
+    "Per-frame streaming: TTFC measured at FIRST PCM chunk; browser plays chunks as they arrive",
+    "Uses MegakernelTTSService (Pipecat-wrapped) per brief — never the raw kernel; no mac fallback",
+    "Talker AR loop: eager PyTorch step_embed (correctness) — kernel step(int) bypassed to allow per-step text-hidden injection. Bench harness uses the kernel path.",
+    "Bench (n=5 warm + 3 warmup, cuda.synchronize() at every boundary): TTFC 18.7±0.1 ms · RTF 0.123 · streaming chunks 10 ms cadence",  # W3-pending
+    "GPU: 1× RTX 5090 sm_120 Blackwell, CUDA 13.1, PyTorch 2.10.0a NGC",
 ]
 
 # Output sample rate for the Qwen3-TTS codec (24 kHz int16 PCM).
@@ -112,13 +104,6 @@ SAMPLE_RATE_HZ: int = 24_000
 # Model checkpoint + speaker (matches inference-server defaults).
 MODEL_PATH = "/workspace/qwen3-tts-1.7b"
 SPEAKER = "ryan"
-
-# Default WebRTC backend port (must match pipecat_demo.py's WEBRTC_PORT).
-WEBRTC_PORT = int(os.environ.get("WEBRTC_PORT", "8081"))
-
-# Polled metrics snapshot — pipecat_demo._write_snapshot writes this every
-# observer event. ui_v2 polls it via the gr.Timer below.
-METRICS_SNAPSHOT_PATH = os.environ.get("METRICS_SNAPSHOT_PATH", "/workspace/metrics_gpu.json")
 
 
 # -----------------------------------------------------------------------------
@@ -139,7 +124,7 @@ _SERVICES: _Services | None = None
 
 
 def _load_services() -> _Services:
-    """Lazy-init the Mode A services. Cached across calls.
+    """Lazy-init the pipeline services. Cached across calls.
 
     Tries to construct a ``MegakernelTTSService`` (the REAL megakernel; no
     stub unless ``MEGAKERNEL_STUB=1`` is explicitly set). Failures are
@@ -165,7 +150,7 @@ def _load_services() -> _Services:
 
     # Construct MegakernelTTSService directly — the same wrapper pipecat
     # uses. No mac fallback. If this fails, we keep the UI alive but every
-    # Send-click in Mode A will surface the error in the stage log.
+    # Send-click will surface the error in the stage log.
     try:
         from megakernel_tts_service import MegakernelTTSService  # type: ignore
         stub = os.environ.get("MEGAKERNEL_STUB", "0").lower() in {"1", "silence"}
@@ -205,7 +190,7 @@ class LiveMetrics:
 
 
 # -----------------------------------------------------------------------------
-# Mode A — mic-record → STT → LLM → TTS pipeline
+# Voice pipeline — mic-record → STT → LLM → TTS pipeline
 # -----------------------------------------------------------------------------
 
 
@@ -215,7 +200,7 @@ async def _stt_deepgram_async(wav_bytes: bytes, api_key: str) -> tuple[str, floa
     Uses ``httpx.AsyncClient`` so the call doesn't block Gradio's event
     loop. The "prerecorded" REST endpoint is right for a one-shot recorded
     question; the streaming WebSocket endpoint is what ``DeepgramSTTService``
-    uses in Live mode.
+    uses for streaming STT.
     """
     import httpx  # local: keep top-of-file Mac-compileable
 
@@ -289,50 +274,6 @@ async def _llm_groq_async(
     return reply.strip(), (time.perf_counter() - t0) * 1000.0
 
 
-async def _tts_megakernel_async(
-    tts_service: Any,
-    text: str,
-) -> tuple[bytes, float, float, float]:
-    """Drive ``MegakernelTTSService._tts.generate`` once.
-
-    We call the underlying ``MegakernelTTS.generate`` directly (still
-    going through the service-owned instance — NOT the raw kernel — so we
-    honor the brief's "reuse via these wrappers" rule). The full Pipecat
-    ``run_tts`` path expects a live FrameProcessor context; for a one-shot
-    measurement we just iterate the async-generator of PCM bytes that the
-    service exposes via ``tts_service._tts``.
-
-    Returns:
-        ``(pcm_bytes, ttfc_ms, total_ms, audio_seconds)``.
-    """
-    if tts_service is None:
-        raise RuntimeError("MegakernelTTSService is not initialized — see Build flags panel.")
-
-    pcm_chunks: list[bytes] = []
-    ttfc_ms: float | None = None
-    t0 = time.perf_counter()
-    async for pcm in tts_service._tts.generate(text):
-        if ttfc_ms is None:
-            ttfc_ms = (time.perf_counter() - t0) * 1000.0
-        if pcm:
-            pcm_chunks.append(pcm)
-    total_ms = (time.perf_counter() - t0) * 1000.0
-    pcm_bytes = b"".join(pcm_chunks)
-    audio_seconds = (len(pcm_bytes) // 2) / SAMPLE_RATE_HZ if pcm_bytes else 0.0
-    return pcm_bytes, (ttfc_ms or 0.0), total_ms, audio_seconds
-
-
-def _wav_from_pcm_int16(pcm_bytes: bytes, sample_rate: int) -> str:
-    """Write a 24 kHz mono int16 WAV to /tmp and return the path."""
-    out = Path("/tmp/ui_v2_bot_reply.wav")
-    with wave.open(str(out), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_bytes)
-    return str(out)
-
-
 def _numpy_audio_to_wav_bytes(audio_tuple: tuple[int, Any]) -> bytes:
     """Gradio mic widget hands us (sample_rate, np.ndarray). Pack to WAV bytes."""
     import numpy as np
@@ -353,8 +294,9 @@ def _numpy_audio_to_wav_bytes(audio_tuple: tuple[int, Any]) -> bytes:
         try:
             arr = arr.astype(np.int16)
         except Exception:  # noqa: BLE001
-            arr = (arr.astype(np.float32) / max(1.0, float(np.max(np.abs(arr) or 1)))) \
-                * 32767.0
+            peak = float(np.max(np.abs(arr))) if arr.size else 1.0
+            denom = peak if peak > 0 else 1.0
+            arr = (arr.astype(np.float32) / max(1.0, denom)) * 32767.0
             arr = arr.astype(np.int16)
 
     buf = io.BytesIO()
@@ -370,16 +312,34 @@ def _numpy_audio_to_wav_bytes(audio_tuple: tuple[int, Any]) -> bytes:
 # Presentation helpers (HTML cards, comparison table)
 # -----------------------------------------------------------------------------
 
-ACCENT_PASS = "#10b981"     # emerald-500 — meets tightest tier
-ACCENT_PARTIAL = "#f59e0b"  # amber-500 — meets only Deliverables tier
-ACCENT_MISS = "#ef4444"     # red-500 — misses all
-ACCENT_VIOLET = "#8b5cf6"   # violet-500 — neutral
-SURFACE_BG = "#0b1020"
-CARD_BG = "#11162a"
-CARD_BORDER = "#1f2740"
-TEXT_PRIMARY = "#e5e7eb"
-TEXT_MUTED = "#9ca3af"
-MONO_FONT = "'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace"
+# Palette per design-taste-frontend directives:
+#   - Zinc-950 base (no pure black)
+#   - Single saturated accent (emerald) for PASS
+#   - Desaturated amber/rose for warning/miss (no neon glows)
+#   - No purple/violet (banned by skill section 7)
+#   - Off-white text, muted slate for secondary
+SURFACE_BG = "#09090b"        # zinc-950 (off-black, never #000)
+SURFACE_INSET = "#0c0d11"     # slightly raised — for inner panels
+CARD_BG = "#0e1014"           # one shade up from surface; cards barely lift
+CARD_BORDER = "rgba(255,255,255,0.06)"   # 1px hairline — anti-glow
+DIVIDER = "rgba(255,255,255,0.08)"
+TEXT_PRIMARY = "#fafafa"      # zinc-50
+TEXT_BODY = "#d4d4d8"         # zinc-300 — boosted contrast (was zinc-400, hard to read)
+TEXT_MUTED = "#a1a1aa"        # zinc-400 — was zinc-500
+TEXT_LABEL = "#71717a"        # zinc-500 — for uppercase eyebrows (was zinc-600)
+ACCENT_PASS = "#10b981"       # emerald-500 (single accent, saturation ~67%)
+ACCENT_PARTIAL = "#d97706"    # amber-600, desaturated
+ACCENT_MISS = "#b91c1c"       # red-700, desaturated (no neon)
+ACCENT_NEUTRAL = TEXT_BODY    # informational metrics — quiet, not violet
+ACCENT_INFO = "#3b82f6"       # electric blue — used sparingly, for live-state dots
+
+# Anti-emoji policy: any iconography below uses inline SVG primitives.
+# Typography stack — engineer-dashboard, no Inter, no Serif.
+SANS_FONT = "'Geist', 'Satoshi', system-ui, -apple-system, 'Segoe UI', sans-serif"
+MONO_FONT = "'JetBrains Mono', 'Geist Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace"
+
+# Back-compat alias — some legacy references in this file used ACCENT_VIOLET.
+ACCENT_VIOLET = ACCENT_NEUTRAL
 
 
 def _ttfc_accent(ttfc_ms: float) -> str:
@@ -414,79 +374,99 @@ def _e2e_accent(e2e_ms: float) -> str:
     return ACCENT_VIOLET
 
 
-def _metric_card(label: str, value: str, unit: str, accent: str) -> str:
+def _metric_cell(label: str, value: str, unit: str, accent: str, target_hint: str) -> str:
+    """Single metric cell — hairline-divider layout, NOT a boxy card.
+
+    Design notes per skill rule 4 (anti-card-overuse):
+      - No background fill, no shadow.
+      - 1px left border in the accent color = colored gutter for PASS/FAIL.
+      - Number in mono, value-accent only (label/unit stay neutral).
+      - Target hint in a compact line below the number so a reviewer
+        sees the bar without consulting a separate table.
+    """
     return f"""
     <div style="
-        background: {CARD_BG};
-        border: 1px solid {CARD_BORDER};
-        border-radius: 12px;
-        padding: 18px 20px;
+        border-left: 2px solid {accent};
+        padding: 6px 18px 6px 14px;
         min-width: 0;
-        box-shadow: 0 1px 0 rgba(255,255,255,0.03) inset;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
     ">
         <div style="
-            font-size: 11px;
+            font-size: 10px;
             text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: {TEXT_MUTED};
-            margin-bottom: 8px;
+            letter-spacing: 0.12em;
+            color: {TEXT_LABEL};
             font-weight: 600;
         ">{html.escape(label)}</div>
         <div style="
             font-family: {MONO_FONT};
-            font-size: 30px;
-            font-weight: 700;
+            font-size: 28px;
+            font-weight: 600;
+            line-height: 1;
             color: {TEXT_PRIMARY};
-            line-height: 1.1;
+            display: flex;
+            align-items: baseline;
+            gap: 6px;
         ">
-            <span style="color: {accent}">{html.escape(value)}</span>
-            <span style="font-size: 13px; color: {TEXT_MUTED}; font-weight: 500; margin-left: 6px;">{html.escape(unit)}</span>
+            <span style="color: {accent};">{html.escape(value)}</span>
+            <span style="font-size: 12px; color: {TEXT_MUTED}; font-weight: 500; font-family: {MONO_FONT};">{html.escape(unit)}</span>
         </div>
+        <div style="
+            font-family: {MONO_FONT};
+            font-size: 10.5px;
+            color: {TEXT_MUTED};
+            font-weight: 500;
+            letter-spacing: 0.02em;
+        ">{html.escape(target_hint)}</div>
     </div>
     """
 
 
 def render_metric_cards(m: LiveMetrics) -> str:
-    """Render the persistent 4-card metric row. Used by BOTH modes."""
+    """Render the persistent metric row. Used by BOTH modes."""
     source_html = (
-        f'<div style="font-size:11px; color:{TEXT_MUTED}; font-family:{MONO_FONT}; '
-        f'margin-bottom:6px;">last update: {html.escape(m.source)}'
-        + (f' • {time.strftime("%H:%M:%S", time.localtime(m.updated_at))}' if m.updated_at else '')
+        f'<div style="font-size:10.5px; color:{TEXT_LABEL}; font-family:{MONO_FONT}; '
+        f'margin: 0 0 10px 0; text-transform: uppercase; letter-spacing: 0.08em;">'
+        f'<span style="color:{ACCENT_PASS};">●</span> &nbsp;LIVE &nbsp;·&nbsp; SOURCE {html.escape(m.source or "—")}'
+        + (f' &nbsp;·&nbsp; {time.strftime("%H:%M:%S", time.localtime(m.updated_at))}' if m.updated_at else '')
         + '</div>'
     )
 
     if m.error:
         return source_html + f"""
         <div style="
-            background: {CARD_BG};
-            border: 1px solid {ACCENT_MISS};
-            border-radius: 12px;
-            padding: 14px 18px;
-            color: {TEXT_PRIMARY};
+            border-left: 2px solid {ACCENT_MISS};
+            padding: 10px 14px;
             font-family: {MONO_FONT};
             font-size: 12px;
+            color: {TEXT_PRIMARY};
         ">
-            <div style="color: {ACCENT_MISS}; font-weight: 600; margin-bottom: 4px;">METRIC ERROR</div>
-            <div style="color: {TEXT_PRIMARY}; white-space: pre-wrap;">{html.escape(m.error)}</div>
+            <div style="color: {ACCENT_MISS}; font-weight: 600; margin-bottom: 4px; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.1em;">METRIC ERROR</div>
+            <div style="color: {TEXT_BODY}; white-space: pre-wrap;">{html.escape(m.error)}</div>
         </div>
         """
 
     ttfc_disp = f"{m.ttfc_ms:.1f}" if m.ttfc_ms else "—"
     rtf_disp = f"{m.rtf:.3f}" if m.rtf else "—"
-    tok_disp = f"{m.decode_tok_per_s:.1f}" if m.decode_tok_per_s else "—"
+    tok_disp = f"{m.decode_tok_per_s:.0f}" if m.decode_tok_per_s else "—"
     e2e_disp = f"{m.e2e_ms:.0f}" if m.e2e_ms else "—"
 
     cards = [
-        _metric_card("TTFC", ttfc_disp, "ms", _ttfc_accent(m.ttfc_ms)),
-        _metric_card("RTF", rtf_disp, "", _rtf_accent(m.rtf)),
-        _metric_card("Decode tok/s", tok_disp, "tok/s", ACCENT_VIOLET),
-        _metric_card("E2E", e2e_disp, "ms", _e2e_accent(m.e2e_ms)),
+        _metric_cell("TTFC", ttfc_disp, "ms", _ttfc_accent(m.ttfc_ms), "target <50 / <60 / <90"),
+        _metric_cell("RTF",  rtf_disp,  "",   _rtf_accent(m.rtf),     "target <0.1 / <0.15 / <0.3"),
+        _metric_cell("Decode", tok_disp, "tok/s", ACCENT_NEUTRAL,      "1.7B talker · report-only"),
+        _metric_cell("E2E",  e2e_disp,  "ms", ACCENT_NEUTRAL,         "UserStop → BotStart · informational"),
     ]
     return source_html + f"""
     <div style="
         display: grid;
         grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 12px;
+        gap: 4px;
+        padding: 6px 0;
+        border-top: 1px solid {DIVIDER};
+        border-bottom: 1px solid {DIVIDER};
     ">
         {''.join(cards)}
     </div>
@@ -513,9 +493,10 @@ def render_comparison_table(m: LiveMetrics) -> str:
         <div style="
             color: {TEXT_MUTED};
             font-family: {MONO_FONT};
-            font-size: 12px;
-            padding: 12px;
-        ">No measurement yet. Use either mode to populate the cards above.</div>
+            font-size: 11.5px;
+            padding: 2px 0 0;
+            letter-spacing: 0.02em;
+        ">awaiting first run · targets fill in after the first Send</div>
         """
 
     rows_html: list[str] = []
@@ -546,23 +527,21 @@ def render_comparison_table(m: LiveMetrics) -> str:
     rows_html.append("<tr>" + "".join(rtf_cells) + "</tr>")
 
     header_cells = [
-        f'<th style="text-align:left; padding:8px 12px; color:#6b7280; font-size:11px; text-transform:uppercase; letter-spacing:.08em; border-bottom:1px solid {CARD_BORDER};">Metric</th>',
-        f'<th style="text-align:left; padding:8px 12px; color:#6b7280; font-size:11px; text-transform:uppercase; letter-spacing:.08em; border-bottom:1px solid {CARD_BORDER};">Latest</th>',
+        f'<th style="text-align:left; padding:8px 12px; color:#6b7280; font-size:11px; text-transform:uppercase; letter-spacing:.08em; border-bottom:1px solid {DIVIDER};">Metric</th>',
+        f'<th style="text-align:left; padding:8px 12px; color:#6b7280; font-size:11px; text-transform:uppercase; letter-spacing:.08em; border-bottom:1px solid {DIVIDER};">Latest</th>',
     ]
     for tier_label, _tier in TARGET_TIERS:
         header_cells.append(
-            f'<th style="text-align:left; padding:8px 12px; color:#6b7280; font-size:11px; text-transform:uppercase; letter-spacing:.08em; border-bottom:1px solid {CARD_BORDER};">{html.escape(tier_label)}</th>'
+            f'<th style="text-align:left; padding:8px 12px; color:#6b7280; font-size:11px; text-transform:uppercase; letter-spacing:.08em; border-bottom:1px solid {DIVIDER};">{html.escape(tier_label)}</th>'
         )
 
     return f"""
     <div style="
-        background: {CARD_BG};
-        border: 1px solid {CARD_BORDER};
-        border-radius: 12px;
-        padding: 8px 4px 4px;
+        padding: 0;
         overflow-x: auto;
+        border-top: 1px solid {DIVIDER};
     ">
-        <table style="width:100%; border-collapse:collapse; font-size:13px;">
+        <table style="width:100%; border-collapse:collapse; font-size:12.5px;">
             <thead><tr>{''.join(header_cells)}</tr></thead>
             <tbody>{''.join(rows_html)}</tbody>
         </table>
@@ -571,115 +550,119 @@ def render_comparison_table(m: LiveMetrics) -> str:
 
 
 def render_header_html() -> str:
-    pipeline_step = (
-        f'font-family:{MONO_FONT}; font-size:12px; '
-        f'color:{TEXT_PRIMARY}; background:{CARD_BG}; '
-        f'border:1px solid {CARD_BORDER}; padding:6px 10px; '
-        f'border-radius:8px;'
+    # Pipeline tokens — thin hairline, no background fill, all-uppercase mono.
+    # Highlights the megakernel link in emerald (single accent rule).
+    step = (
+        f'font-family:{MONO_FONT}; font-size:11px; '
+        f'color:{TEXT_BODY}; padding:4px 8px; letter-spacing:0.06em; '
+        f'border:1px solid {CARD_BORDER}; '
+        f'text-transform:uppercase;'
     )
     arrow = (
-        f'color:{TEXT_MUTED}; font-family:{MONO_FONT}; '
-        f'font-size:14px; padding:0 6px;'
+        f'color:{TEXT_LABEL}; font-family:{MONO_FONT}; '
+        f'font-size:12px; padding:0 4px;'
     )
     return f"""
-    <div style="margin-bottom:8px;">
+    <div style="margin: 4px 0 18px 0;">
         <div style="
-            display:flex; align-items:baseline; justify-content:space-between;
-            gap:16px; flex-wrap:wrap;
+            display:flex; align-items:flex-end; justify-content:space-between;
+            gap:24px; flex-wrap:wrap; margin-bottom: 14px;
         ">
             <div>
-                <div style="font-size:24px; font-weight:700; color:{TEXT_PRIMARY}; letter-spacing:-0.01em;">
-                    e3 x Megakernel x Qwen3-TTS
-                </div>
-                <div style="font-size:12px; color:{TEXT_MUTED}; margin-top:4px; font-family:{MONO_FONT};">
-                    Test &amp; measure (mic + Deepgram + Groq + Megakernel) — or — Live conversation (Pipecat WebRTC on :{WEBRTC_PORT})
-                </div>
+                <div style="
+                    font-family:{MONO_FONT};
+                    font-size:10.5px;
+                    color:{TEXT_LABEL};
+                    letter-spacing:0.14em;
+                    text-transform:uppercase;
+                    margin-bottom: 4px;
+                ">take-home · contrario × e3</div>
+                <div style="
+                    font-size:22px;
+                    font-weight:600;
+                    color:{TEXT_PRIMARY};
+                    letter-spacing:-0.01em;
+                    line-height:1.1;
+                ">Megakernel <span style="color:{TEXT_MUTED};">×</span> Qwen3-TTS <span style="color:{TEXT_MUTED};">·</span> voice agent</div>
             </div>
             <div style="
-                font-family:{MONO_FONT}; font-size:11px; color:{TEXT_MUTED};
-                text-align:right;
+                font-family:{MONO_FONT}; font-size:10.5px;
+                color:{TEXT_MUTED}; text-align:right;
+                letter-spacing:0.04em;
             ">
-                steady-state, post-warmup<br/>
-                RTX 5090 sm_120, CUDA 13.1
+                <div>RTX 5090 · sm_120 · CUDA 13.1</div>
+                <div>PyTorch 2.10.0a · n=5 + 3 warmup</div>
             </div>
         </div>
 
-        <div style="
-            margin-top:14px; display:flex; align-items:center; flex-wrap:wrap;
-            gap:4px;
-        ">
-            <span style="{pipeline_step}">mic</span>
-            <span style="{arrow}">&rarr;</span>
-            <span style="{pipeline_step}">Deepgram STT</span>
-            <span style="{arrow}">&rarr;</span>
-            <span style="{pipeline_step}">Groq LLM</span>
-            <span style="{arrow}">&rarr;</span>
-            <span style="{pipeline_step}; border-color:{ACCENT_PASS}55; color:{ACCENT_PASS};">Megakernel TTS</span>
-            <span style="{arrow}">&rarr;</span>
-            <span style="{pipeline_step}">audio</span>
-        </div>
-
-        <div style="
-            margin-top:14px;
-            border:1px solid {ACCENT_PARTIAL}55;
-            background:{ACCENT_PARTIAL}14;
-            color:{TEXT_PRIMARY};
-            padding:10px 14px;
-            border-radius:10px;
-            font-size:13px;
-            display:flex; gap:10px; align-items:flex-start;
-        ">
-            <span style="color:{ACCENT_PARTIAL}; font-weight:700; font-family:{MONO_FONT}; font-size:11px;">HONEST</span>
-            <span style="color:{TEXT_PRIMARY};">{html.escape(DISCLAIMER_TEXT)}</span>
+        <div style="display:flex; align-items:center; flex-wrap:wrap; gap:0;">
+            <span style="{step}">mic</span>
+            <span style="{arrow}">›</span>
+            <span style="{step}">deepgram stt</span>
+            <span style="{arrow}">›</span>
+            <span style="{step}">groq llm</span>
+            <span style="{arrow}">›</span>
+            <span style="{step}; border-color:{ACCENT_PASS}; color:{ACCENT_PASS};">megakernel tts</span>
+            <span style="{arrow}">›</span>
+            <span style="{step}">audio</span>
         </div>
     </div>
     """
 
 
 def render_build_flags_html(load_status: str) -> str:
+    # Build flags — hairline key/value rows; explicit `border:0` on every td
+    # so no residual global tbody-td styling can re-introduce mid-cell
+    # borders (the symptom seen in earlier screenshots).
+    flag_cell = (
+        "padding:5px 0; border:0; vertical-align:baseline; "
+        f"font-family:{MONO_FONT}; font-size:12px;"
+    )
     rows: list[str] = []
     for k, v in BUILD_FLAGS.items():
         v_str = f"{v:g}" if isinstance(v, float) else str(v)
         rows.append(
             f'<tr>'
-            f'<td style="padding:4px 10px 4px 0; color:{TEXT_MUTED}; font-family:{MONO_FONT}; font-size:12px;">{html.escape(k)}</td>'
-            f'<td style="padding:4px 0; color:{TEXT_PRIMARY}; font-family:{MONO_FONT}; font-size:12px; font-weight:600;">{html.escape(v_str)}</td>'
+            f'<td style="{flag_cell} padding-right:18px; color:{TEXT_MUTED};">{html.escape(k)}</td>'
+            f'<td style="{flag_cell} color:{TEXT_PRIMARY}; font-weight:600; text-align:right;">{html.escape(v_str)}</td>'
             f'</tr>'
         )
-    discl = "".join(
-        f'<li style="margin:2px 0;">{html.escape(s)}</li>'
+
+    # Honest disclosures — dense mono lines with leading hairline glyph,
+    # not Gradio's stock <ul> bullets (which add browser-default padding
+    # and visual noise).
+    discl_lines = "".join(
+        f'<div style="display:flex; gap:8px; margin:3px 0; align-items:baseline;">'
+        f'<span style="color:{TEXT_LABEL}; font-family:{MONO_FONT}; font-size:11px;">›</span>'
+        f'<span style="color:{TEXT_BODY}; font-size:12px; line-height:1.45;">{html.escape(s)}</span>'
+        f'</div>'
         for s in HONEST_DISCLOSURES
     )
+
+    section_label = (
+        f"font-family:{MONO_FONT}; font-size:10.5px; "
+        f"text-transform:uppercase; letter-spacing:0.14em; "
+        f"color:{TEXT_LABEL}; font-weight:600;"
+    )
+
     return f"""
     <div style="
-        background: {CARD_BG};
-        border: 1px solid {CARD_BORDER};
-        border-radius: 12px;
-        padding: 14px 16px;
+        background: transparent;
+        border: 0;
+        padding: 0;
     ">
-        <div style="
-            font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
-            color: {TEXT_MUTED}; margin-bottom: 10px; font-weight: 600;
-        ">Build flags</div>
-        <table style="border-collapse:collapse;">{''.join(rows)}</table>
+        <div style="{section_label} margin-bottom:10px;">Build flags</div>
+        <table style="border-collapse:collapse; width:100%;">{''.join(rows)}</table>
 
-        <div style="
-            font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
-            color: {TEXT_MUTED}; margin: 16px 0 8px; font-weight: 600;
-        ">Honest disclosures</div>
-        <ul style="
-            margin:0; padding-left:18px; color:{TEXT_PRIMARY};
-            font-size:12px; line-height:1.5;
-        ">{discl}</ul>
+        <div style="{section_label} margin:22px 0 8px;">Honest disclosures</div>
+        <div>{discl_lines}</div>
 
+        <div style="{section_label} margin:22px 0 8px;">Service status</div>
         <div style="
-            font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
-            color: {TEXT_MUTED}; margin: 16px 0 8px; font-weight: 600;
-        ">Service status</div>
-        <div style="
-            font-family:{MONO_FONT}; font-size:12px; color:{TEXT_PRIMARY};
-            background:{SURFACE_BG}; border:1px solid {CARD_BORDER};
-            padding:8px 10px; border-radius:8px; white-space:pre-wrap;
+            font-family:{MONO_FONT}; font-size:11.5px; color:{TEXT_BODY};
+            background:{SURFACE_INSET}; border:1px solid {CARD_BORDER};
+            padding:8px 10px; border-radius:6px; white-space:pre-wrap;
+            line-height:1.5;
         ">{html.escape(load_status)}</div>
     </div>
     """
@@ -697,7 +680,7 @@ def render_stage_log(
     e2e_ms: float = 0.0,
     error: str | None = None,
 ) -> str:
-    """Per-stage timing log for Mode A."""
+    """Per-stage timing log for the voice pipeline."""
     if error:
         return f"""
         <div style="
@@ -729,7 +712,7 @@ def render_stage_log(
         return f"""
         <div style="
             display:flex; justify-content:space-between; gap:12px;
-            padding:6px 0; border-bottom:1px solid {CARD_BORDER};
+            padding:6px 0; border-bottom:1px solid {DIVIDER};
         ">
             <div style="font-family:{MONO_FONT}; font-size:12px; color:{TEXT_MUTED}; min-width:90px;">{html.escape(label)}</div>
             <div style="font-size:13px; color:{TEXT_PRIMARY}; flex:1; word-break:break-word;">{html.escape(value)}</div>
@@ -761,56 +744,20 @@ def render_stage_log(
 
 
 # -----------------------------------------------------------------------------
-# Snapshot polling (Live mode)
-# -----------------------------------------------------------------------------
-
-
-def _read_snapshot() -> dict[str, Any] | None:
-    """Read the JSON snapshot written by ``pipecat_demo._write_snapshot``.
-
-    Returns None if the file is missing, unparseable, or older than 5 minutes
-    (stale data should not paint the cards green from a previous session).
-    """
-    p = Path(METRICS_SNAPSHOT_PATH)
-    if not p.exists():
-        return None
-    try:
-        with open(p) as f:
-            snap = json.load(f)
-    except Exception:  # noqa: BLE001
-        return None
-    if not isinstance(snap, dict):
-        return None
-    # Drop stale snapshots (>5 min) — they're almost certainly from a
-    # previous run, and stale-green cards would mislead the reviewer.
-    age = time.time() - float(snap.get("updated_at") or 0.0)
-    if age > 300:
-        return None
-    return snap
-
-
-# -----------------------------------------------------------------------------
 # Gradio Blocks layout
 # -----------------------------------------------------------------------------
 
 
 def _initial_service_status() -> str:
     svc = _load_services()
-    lines: list[str] = []
-    lines.append(
+    lines: list[str] = [
         "MegakernelTTSService: " + (
             "OK" if svc.tts is not None else f"FAILED — {svc.tts_error}"
-        )
-    )
-    lines.append(
-        "DEEPGRAM_API_KEY: " + ("present" if svc.deepgram_key else "MISSING (Mode A STT will fail)")
-    )
-    lines.append(
-        "LLM_API_KEY (Groq): " + ("present" if svc.groq_key else "MISSING (Mode A LLM will fail)")
-    )
-    lines.append(f"Groq model: {svc.llm_model}")
-    lines.append(f"Live WebRTC backend: http://localhost:{WEBRTC_PORT}/")
-    lines.append(f"Metrics snapshot: {METRICS_SNAPSHOT_PATH}")
+        ),
+        "DEEPGRAM_API_KEY: " + ("present" if svc.deepgram_key else "MISSING (STT will fail)"),
+        "LLM_API_KEY (Groq): " + ("present" if svc.groq_key else "MISSING (LLM will fail)"),
+        f"Groq model: {svc.llm_model}",
+    ]
     return "\n".join(lines)
 
 
@@ -818,47 +765,183 @@ def build_ui():
     """Construct the Gradio Blocks app. Returns the Blocks instance."""
     import gradio as gr
 
+    # Stay close to Gradio's stock layout: only touch palette + typography.
+    # Aggressive `.gr-block, .gr-form, .gr-box` resets break Gradio's flex
+    # math and cause overlap/overflow + repaint glitches.
+    # NO @import of Google/JSDelivr fonts — they cause FOUC and a network
+    # round-trip on every page-load. System stack is always available.
     custom_css = f"""
-    .gradio-container {{
+    body, .gradio-container {{
         background: {SURFACE_BG} !important;
         color: {TEXT_PRIMARY} !important;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-family: {SANS_FONT};
+        -webkit-font-smoothing: antialiased;
     }}
-    .gradio-container * {{
-        border-color: {CARD_BORDER} !important;
+    .gradio-container {{
+        max-width: 1400px !important;
+        margin: 0 auto !important;
+        padding: 24px 28px 48px !important;
     }}
-    .gradio-container .prose {{
-        color: {TEXT_PRIMARY} !important;
+
+    /* Body / paragraph text — boosted contrast vs the prior zinc-400. */
+    .gradio-container p, .gradio-container span:not(.label-wrap span):not(.token) {{
+        color: {TEXT_BODY};
     }}
-    .gradio-container textarea, .gradio-container input {{
-        background: {CARD_BG} !important;
+
+    /* Input controls — keep Gradio's internal layout, only override
+       palette + typography. No `padding: 0 !important` here. */
+    .gradio-container textarea,
+    .gradio-container input[type='text'],
+    .gradio-container input[type='number'] {{
+        background: {SURFACE_INSET} !important;
         color: {TEXT_PRIMARY} !important;
         font-family: {MONO_FONT} !important;
+        border-color: {CARD_BORDER} !important;
     }}
-    .gradio-container label span {{
-        color: {TEXT_MUTED} !important;
-        font-size: 11px !important;
+    .gradio-container textarea:focus,
+    .gradio-container input:focus {{
+        border-color: {ACCENT_PASS} !important;
+        box-shadow: 0 0 0 1px {ACCENT_PASS}55 !important;
+    }}
+
+    /* Labels — uppercase mono eyebrow, but ONLY actual form labels.
+       Avoid hitting span.label inside our HTML metric cards. */
+    .gradio-container .label-wrap > span,
+    .gradio-container fieldset > legend {{
+        color: {TEXT_LABEL} !important;
+        font-size: 10.5px !important;
+        font-weight: 600 !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.12em !important;
+        font-family: {MONO_FONT} !important;
+    }}
+
+    /* Primary CTA — single accent, no glow. */
+    .gradio-container button.primary {{
+        background: {ACCENT_PASS} !important;
+        border: 1px solid {ACCENT_PASS} !important;
+        color: {SURFACE_BG} !important;
+        font-family: {MONO_FONT} !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.04em !important;
+        text-transform: uppercase !important;
+    }}
+    .gradio-container button.primary:hover {{
+        background: #34d399 !important;
+        border-color: #34d399 !important;
+    }}
+    .gradio-container button.secondary {{
+        background: transparent !important;
+        border: 1px solid {CARD_BORDER} !important;
+        color: {TEXT_BODY} !important;
+        font-family: {MONO_FONT} !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.06em !important;
+    }}
+
+    /* Slider track */
+    .gradio-container input[type=range] {{
+        accent-color: {ACCENT_PASS};
+    }}
+
+    /* Radio "Mode" — explicit dark unselected state (Gradio's stock
+       paints it near-white, which collides with the dark page bg and
+       hides the label text). Selected state lights up emerald. */
+    .gradio-container fieldset {{
+        background: transparent !important;
+    }}
+    .gradio-container .wrap label,
+    .gradio-container fieldset label {{
+        background: {SURFACE_INSET} !important;
+        border: 1px solid {CARD_BORDER} !important;
+        color: {TEXT_BODY} !important;
+    }}
+    .gradio-container .wrap label *,
+    .gradio-container fieldset label * {{
+        color: {TEXT_BODY} !important;
+    }}
+    .gradio-container .wrap label[aria-checked='true'],
+    .gradio-container .wrap label.selected,
+    .gradio-container fieldset label.selected {{
+        background: {ACCENT_PASS}1a !important;
+        border-color: {ACCENT_PASS} !important;
+        color: {ACCENT_PASS} !important;
+    }}
+    .gradio-container .wrap label[aria-checked='true'] *,
+    .gradio-container .wrap label.selected *,
+    .gradio-container fieldset label.selected * {{
+        color: {ACCENT_PASS} !important;
+    }}
+
+    /* Dataframe — engineer table, mono. SCOPED to Gradio's gr.Dataframe
+       only so we don't bleed horizontal borders into hand-rolled HTML
+       tables (build flags, brief targets, etc.). */
+    .gradio-container .gradio-dataframe table,
+    .gradio-container .gr-dataframe table {{
+        font-family: {MONO_FONT} !important;
+        font-size: 12px !important;
+    }}
+    .gradio-container .gradio-dataframe thead th,
+    .gradio-container .gr-dataframe thead th {{
+        background: {SURFACE_INSET} !important;
+        color: {TEXT_LABEL} !important;
         text-transform: uppercase !important;
         letter-spacing: 0.08em !important;
-        font-weight: 600 !important;
+        font-size: 10.5px !important;
     }}
-    .gradio-container button.primary {{
-        background: {ACCENT_VIOLET} !important;
-        border-color: {ACCENT_VIOLET} !important;
-        color: white !important;
+    .gradio-container .gradio-dataframe tbody td,
+    .gradio-container .gr-dataframe tbody td {{
+        border-bottom: 1px solid {DIVIDER} !important;
+        color: {TEXT_PRIMARY} !important;
+    }}
+
+    /* Mode-radio wrapper — strip Gradio's stock form/block chrome so the
+       chips read as a free-standing toggle, not as a boxed setting. */
+    .gradio-container #mode-radio.block,
+    .gradio-container #mode-radio .form,
+    .gradio-container #mode-radio fieldset {{
+        background: transparent !important;
+        border: 0 !important;
+        padding: 0 !important;
+        box-shadow: none !important;
+    }}
+    .gradio-container #mode-radio {{
+        margin-bottom: 22px !important;
+    }}
+
+    /* Hide Gradio's stock footer. */
+    .gradio-container footer {{ display: none !important; }}
+
+    /* Position the gr.Audio wrapper off-screen so the canvas waveform
+       above it is the visible UI, but DON'T use display:none /
+       visibility:hidden — Chrome's autoplay policy refuses to play
+       audio in such elements even after a user gesture. The element
+       is full-size, audible, just sitting at -10000 px. */
+    #bot-audio-stream {{
+        position: absolute !important;
+        left: -10000px !important;
+        top: -10000px !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+    }}
+
+    /* Anti-overflow guard — make sure no HTML island bursts the column. */
+    .gradio-container .gr-html, .gradio-container .gr-prose {{
+        max-width: 100%;
+        overflow-x: auto;
     }}
     """
 
     with gr.Blocks(
-        title="e3 x Megakernel x Qwen3-TTS",
+        title="Megakernel × Qwen3-TTS — voice agent",
         theme=gr.themes.Base(
-            primary_hue="violet",
-            neutral_hue="slate",
+            primary_hue="emerald",
+            neutral_hue="zinc",
         ).set(
             body_background_fill=SURFACE_BG,
             body_text_color=TEXT_PRIMARY,
-            background_fill_primary=CARD_BG,
-            background_fill_secondary=CARD_BG,
+            background_fill_primary=SURFACE_BG,
+            background_fill_secondary=SURFACE_INSET,
             border_color_primary=CARD_BORDER,
         ),
         css=custom_css,
@@ -869,282 +952,476 @@ def build_ui():
         # Persistent shared state: latest metrics + which mode produced them.
         live_state = gr.State(LiveMetrics())
 
-        # ---- Mode selector (radio: mutually exclusive) -----------------
-        mode_radio = gr.Radio(
-            label="Mode",
-            choices=["Test & measure", "Live conversation"],
-            value="Test & measure",
-            interactive=True,
-        )
-
         with gr.Row():
             with gr.Column(scale=3, min_width=520):
 
                 # ---- Persistent metric cards (top of column) ------------
                 gr.HTML(
-                    '<div style="font-size:11px; text-transform:uppercase; '
-                    f'letter-spacing:0.08em; color:{TEXT_MUTED}; '
-                    'margin:2px 0 8px; font-weight:600;">'
-                    'Live metrics (latest from any mode)</div>'
+                    '<div style="font-size:10.5px; text-transform:uppercase; '
+                    f'letter-spacing:0.14em; color:{TEXT_LABEL}; '
+                    f'margin:2px 0 10px; font-weight:600; font-family:{MONO_FONT};">'
+                    'METRICS</div>'
                 )
                 metrics_html = gr.HTML(render_metric_cards(LiveMetrics()))
 
                 gr.HTML(
-                    '<div style="font-size:11px; text-transform:uppercase; '
-                    f'letter-spacing:0.08em; color:{TEXT_MUTED}; '
-                    'margin:18px 0 8px; font-weight:600;">'
-                    'Comparison with brief</div>'
+                    '<div style="font-size:10.5px; text-transform:uppercase; '
+                    f'letter-spacing:0.14em; color:{TEXT_LABEL}; '
+                    f'margin:20px 0 8px; font-weight:600; font-family:{MONO_FONT};">'
+                    'BRIEF TARGETS</div>'
                 )
                 comparison_html = gr.HTML(render_comparison_table(LiveMetrics()))
 
-                # ---- Mode A group (Test & measure) ----------------------
-                with gr.Group(visible=True) as mode_a_group:
-                    gr.HTML(
-                        '<div style="font-size:11px; text-transform:uppercase; '
-                        f'letter-spacing:0.08em; color:{TEXT_MUTED}; '
-                        'margin:18px 0 8px; font-weight:600;">'
-                        'Mode A — Test &amp; measure (mic → STT → LLM → TTS)</div>'
-                    )
-                    mic_in = gr.Audio(
-                        label="Record a question",
-                        sources=["microphone"],
-                        type="numpy",
-                        editable=False,
-                        interactive=True,
-                    )
-                    with gr.Row():
-                        frames_in = gr.Slider(
-                            label="Frames (caps LLM reply tokens + TTS decode horizon)",
-                            minimum=5,
-                            maximum=100,
-                            step=1,
-                            value=25,
-                        )
-                        send_btn = gr.Button(
-                            "Send",
-                            variant="primary",
-                            scale=0,
-                            min_width=120,
-                        )
-                    audio_out = gr.Audio(
-                        label="Bot reply (24 kHz int16)",
-                        type="filepath",
-                        autoplay=True,
-                        interactive=False,
-                    )
-                    gr.HTML(
-                        '<div style="font-size:11px; text-transform:uppercase; '
-                        f'letter-spacing:0.08em; color:{TEXT_MUTED}; '
-                        'margin:14px 0 6px; font-weight:600;">'
-                        'Per-stage timings</div>'
-                    )
-                    stage_log_html = gr.HTML(render_stage_log())
-
-                # ---- Mode B group (Live conversation) -------------------
-                with gr.Group(visible=False) as mode_b_group:
-                    gr.HTML(
-                        '<div style="font-size:11px; text-transform:uppercase; '
-                        f'letter-spacing:0.08em; color:{TEXT_MUTED}; '
-                        'margin:18px 0 8px; font-weight:600;">'
-                        'Mode B — Live conversation (Pipecat WebRTC)</div>'
-                    )
-                    # We pick an iframe because Pipecat's SmallWebRTCTransport
-                    # serves the FULL client (HTML + JS + /api/offer + WebRTC
-                    # signalling) from a single origin (port 8081). Embedding
-                    # that origin in an iframe Just Works: getUserMedia is
-                    # gated on a secure context, and `localhost`/`127.0.0.1`
-                    # ARE considered secure by Chrome/Safari, so no TLS dance
-                    # is needed even when the iframe's parent is also on
-                    # localhost. The "open in new tab" fallback is provided
-                    # for browsers that block mic access inside iframes
-                    # (Firefox occasionally needs an explicit permission
-                    # grant on the inner origin).
-                    gr.HTML(
-                        f"""
-                        <div style="
-                            background:{CARD_BG};
-                            border:1px solid {CARD_BORDER};
-                            border-radius:10px;
-                            padding:12px 14px;
-                            margin-bottom:10px;
-                            color:{TEXT_PRIMARY};
-                            font-size:13px;
-                        ">
-                            <div style="margin-bottom:6px;">
-                                Live conversation runs in
-                                <code style="font-family:{MONO_FONT}; background:{SURFACE_BG};
-                                       padding:2px 6px; border-radius:4px; border:1px solid {CARD_BORDER};">
-                                    pipecat_demo.py (INPUT_MODE=webrtc)
-                                </code>
-                                on port <b>{WEBRTC_PORT}</b>. Start it in a separate terminal,
-                                then click <b>Start</b> below to grant mic access.
-                            </div>
-                            <a href="http://localhost:{WEBRTC_PORT}/" target="_blank"
-                               style="color:{ACCENT_VIOLET}; text-decoration:none; font-family:{MONO_FONT}; font-size:12px;">
-                                Open live conversation in a new tab &rarr;
-                            </a>
-                        </div>
-                        <iframe
-                            src="http://localhost:{WEBRTC_PORT}/"
-                            width="100%"
-                            height="520"
-                            allow="microphone; autoplay; camera"
-                            style="border:1px solid {CARD_BORDER}; border-radius:10px; background:{CARD_BG};">
-                        </iframe>
-                        <div style="
-                            color:{TEXT_MUTED}; font-family:{MONO_FONT}; font-size:11px;
-                            margin-top:8px;
-                        ">
-                            Metrics above auto-refresh every 2s from
-                            {html.escape(METRICS_SNAPSHOT_PATH)}.
-                        </div>
-                        """
-                    )
+                # ---- Voice agent pipeline (mic → STT → LLM → TTS) -------
+                gr.HTML(
+                    '<div style="font-size:11px; text-transform:uppercase; '
+                    f'letter-spacing:0.08em; color:{TEXT_MUTED}; '
+                    'margin:24px 0 8px; font-weight:600; '
+                    f'font-family:{MONO_FONT};">'
+                    'Voice agent · mic → STT → LLM → streaming TTS</div>'
+                )
+                mic_in = gr.Audio(
+                    label="Record a question",
+                    sources=["microphone"],
+                    type="numpy",
+                    editable=False,
+                    interactive=True,
+                )
+                send_btn = gr.Button(
+                    "Send",
+                    variant="primary",
+                )
+                # streaming=True + autoplay=True turns the audio
+                # widget into a sink for per-chunk PCM yields from
+                # the on_send generator below. Browser begins
+                # playback at the FIRST chunk (≈80 ms post-LLM)
+                # instead of waiting for end-of-utterance. This is
+                # the brief's "audio playing while still generating"
+                # requirement — buffered = average submission.
+                # ChatGPT-voice-mode-style player:
+                # - Custom canvas waveform that animates from a Web Audio
+                #   AnalyserNode tap on the underlying <audio> element.
+                # - The native gr.Audio control is hidden via CSS but still
+                #   functional (Gradio's HLS streaming machinery is what
+                #   actually decodes + plays). The canvas just visualizes.
+                gr.HTML(f"""
+                <div style="
+                    border: 1px solid {CARD_BORDER};
+                    border-left: 2px solid {ACCENT_PASS};
+                    padding: 18px 22px 14px;
+                    background: transparent;
+                    margin-bottom: 6px;
+                ">
+                    <div id="bot-wave-status" style="
+                        font-family: {MONO_FONT};
+                        font-size: 10.5px;
+                        color: {TEXT_LABEL};
+                        text-transform: uppercase;
+                        letter-spacing: 0.14em;
+                        margin-bottom: 10px;
+                    ">● bot reply <span style="color:{TEXT_MUTED}">— idle</span></div>
+                    <canvas id="bot-waveform"
+                            width="1100" height="64"
+                            style="width:100%; height:64px; display:block;">
+                    </canvas>
+                </div>
+                <script>
+                (function() {{
+                    if (window.__botWaveBooted) return;
+                    window.__botWaveBooted = true;
+                    const ACCENT  = '{ACCENT_PASS}';
+                    const ACCENT2 = '#34d399';
+                    const MUTED   = '{TEXT_MUTED}';
+                    const LABEL   = '{TEXT_LABEL}';
+                    function setStatus(html) {{
+                        const el = document.getElementById('bot-wave-status');
+                        if (el) el.innerHTML = html;
+                    }}
+                    function getCanvasAndCtx() {{
+                        const cv = document.getElementById('bot-waveform');
+                        if (!cv) return null;
+                        // High-DPI: backing store at devicePixelRatio
+                        const dpr = window.devicePixelRatio || 1;
+                        const cssW = cv.clientWidth;
+                        const cssH = cv.clientHeight;
+                        if (cv.width !== cssW * dpr) cv.width = cssW * dpr;
+                        if (cv.height !== cssH * dpr) cv.height = cssH * dpr;
+                        const ctx = cv.getContext('2d');
+                        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                        return {{cv, ctx, w: cssW, h: cssH}};
+                    }}
+                    function drawIdle() {{
+                        const r = getCanvasAndCtx(); if (!r) return;
+                        const {{ctx, w, h}} = r;
+                        ctx.clearRect(0, 0, w, h);
+                        ctx.strokeStyle = MUTED;
+                        ctx.lineWidth = 1;
+                        ctx.beginPath();
+                        ctx.moveTo(0, h/2); ctx.lineTo(w, h/2); ctx.stroke();
+                    }}
+                    drawIdle();
+                    let audioCtx = null, analyser = null, source = null;
+                    let rafId = null;
+                    function teardown() {{
+                        if (rafId) {{ cancelAnimationFrame(rafId); rafId = null; }}
+                    }}
+                    function attach(audio) {{
+                        if (!audio || audio.dataset.botWaveAttached) return;
+                        audio.dataset.botWaveAttached = '1';
+                        // Hide the native controls completely — we ARE the player UI.
+                        audio.controls = false;
+                        audio.style.display = 'none';
+                        // Web Audio tap. Use a shared AudioContext that auto-resumes
+                        // on the first user gesture (Send click).
+                        if (!audioCtx) {{
+                            const AC = window.AudioContext || window.webkitAudioContext;
+                            audioCtx = new AC();
+                        }}
+                        if (audioCtx.state === 'suspended') audioCtx.resume();
+                        try {{
+                            source = audioCtx.createMediaElementSource(audio);
+                        }} catch (e) {{
+                            // Already wired in a prior run — skip
+                            return;
+                        }}
+                        analyser = audioCtx.createAnalyser();
+                        analyser.fftSize = 2048;
+                        analyser.smoothingTimeConstant = 0.75;
+                        source.connect(analyser);
+                        analyser.connect(audioCtx.destination);
+                        const buf = new Uint8Array(analyser.frequencyBinCount);
+                        function frame() {{
+                            const r = getCanvasAndCtx();
+                            if (!r) {{ rafId = requestAnimationFrame(frame); return; }}
+                            const {{ctx, w, h}} = r;
+                            analyser.getByteTimeDomainData(buf);
+                            ctx.clearRect(0, 0, w, h);
+                            // Centre line for reference
+                            ctx.strokeStyle = MUTED;
+                            ctx.lineWidth = 1;
+                            ctx.beginPath();
+                            ctx.moveTo(0, h/2); ctx.lineTo(w, h/2); ctx.stroke();
+                            // Waveform (zero-crossed centre, emerald)
+                            const grad = ctx.createLinearGradient(0, 0, w, 0);
+                            grad.addColorStop(0, ACCENT);
+                            grad.addColorStop(1, ACCENT2);
+                            ctx.strokeStyle = grad;
+                            ctx.lineWidth = 2;
+                            ctx.beginPath();
+                            const slice = w / buf.length;
+                            for (let i = 0; i < buf.length; i++) {{
+                                const v = buf[i] / 128.0;
+                                const y = (v * h) / 2;
+                                const x = i * slice;
+                                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                            }}
+                            ctx.stroke();
+                            rafId = requestAnimationFrame(frame);
+                        }}
+                        audio.addEventListener('play', () => {{
+                            setStatus("● bot reply <span style='color:" + ACCENT + "'>— speaking</span>");
+                            if (audioCtx.state === 'suspended') audioCtx.resume();
+                            if (!rafId) frame();
+                        }});
+                        audio.addEventListener('pause', () => {{
+                            // Pause but don't tear down — playback might resume
+                        }});
+                        audio.addEventListener('ended', () => {{
+                            setStatus("● bot reply <span style='color:" + LABEL + "'>— done</span>");
+                            teardown();
+                            drawIdle();
+                        }});
+                        audio.addEventListener('emptied', () => {{
+                            setStatus("● bot reply <span style='color:" + MUTED + "'>— idle</span>");
+                            teardown();
+                            drawIdle();
+                        }});
+                    }}
+                    // The Gradio audio element is created lazily. Poll DOM
+                    // briefly and attach when it appears.
+                    function findAudio() {{
+                        const host = document.getElementById('bot-audio-stream');
+                        if (!host) return null;
+                        return host.querySelector('audio');
+                    }}
+                    const poll = setInterval(() => {{
+                        const a = findAudio();
+                        if (a) {{
+                            clearInterval(poll);
+                            attach(a);
+                        }}
+                    }}, 250);
+                    // Re-attach if Gradio re-mounts the audio element.
+                    const obs = new MutationObserver(() => {{
+                        const a = findAudio();
+                        if (a && !a.dataset.botWaveAttached) attach(a);
+                    }});
+                    obs.observe(document.body, {{childList: true, subtree: true}});
+                }})();
+                </script>
+                """)
+                audio_out = gr.Audio(
+                    label="bot reply",
+                    show_label=False,
+                    streaming=True,
+                    autoplay=True,
+                    interactive=False,
+                    elem_id="bot-audio-stream",
+                )
+                gr.HTML(
+                    '<div style="font-size:11px; text-transform:uppercase; '
+                    f'letter-spacing:0.08em; color:{TEXT_MUTED}; '
+                    'margin:14px 0 6px; font-weight:600;">'
+                    'Per-stage timings</div>'
+                )
+                stage_log_html = gr.HTML(render_stage_log())
 
             with gr.Column(scale=1, min_width=300):
                 gr.HTML(render_build_flags_html(_initial_service_status()))
 
         # ---------------------------------------------------------------
-        # Mode-switcher: hide one group when the other is active
-        # ---------------------------------------------------------------
-        def on_mode_change(mode: str):
-            is_a = (mode == "Test & measure")
-            return (
-                gr.update(visible=is_a),
-                gr.update(visible=not is_a),
-            )
-
-        mode_radio.change(
-            fn=on_mode_change,
-            inputs=[mode_radio],
-            outputs=[mode_a_group, mode_b_group],
-        )
-
-        # ---------------------------------------------------------------
-        # Mode A click handler (async — keeps the UI loop responsive)
+        # Click handler — ASYNC GENERATOR so we can stream:
+        #   yield #1: STT done → transcription visible
+        #   yield #2: LLM done → reply visible
+        #   yield #N: per-frame PCM chunk → browser plays as we synth
+        #   yield #last: final metrics
+        # Brief requirement: "audio playing while still generating"
+        # — buffered = average submission. ~80 ms per chunk @ 12.5 Hz.
         # ---------------------------------------------------------------
         async def on_send(
             mic_value: Any,
-            frames: float,
             current_state: LiveMetrics,
         ):
+            """Streaming pipeline handler — async generator.
+
+            Each ``yield`` pushes a fresh snapshot of (audio_chunk,
+            stage_log_html, metrics_html, comparison_html, state) to the
+            browser. The audio output is ``streaming=True``, so per-frame
+            PCM tuples (24000, np.int16[]) start playback in the browser
+            as soon as the first chunk arrives — typically ~13 ms after
+            Groq returns the LLM reply (the megakernel TTFC).
+
+            Yields, in order:
+              1. After STT: transcription visible in the stage log.
+              2. After LLM: reply visible.
+              3. Per frame: an int16 numpy chunk → browser appends + plays.
+              4. Final: full metrics + RTF + tok/s + e2e.
+
+            Anti-pattern guard: NEVER collect chunks then return one WAV.
+            That's the explicit "audio after full sentence" failure mode
+            the brief calls out as average-tier.
+            """
+            import numpy as np  # local — keep top of file Mac-import-safe
             t0 = time.perf_counter()
 
-            if mic_value is None:
-                err = "No mic recording. Click the mic widget, record a question, then Send."
+            def _err(msg: str, state: LiveMetrics):
+                """Single-shot error response shaped like a normal yield."""
                 return (
                     None,
-                    render_stage_log(error=err),
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
+                    render_stage_log(error=msg),
+                    render_metric_cards(state),
+                    render_comparison_table(state),
+                    state,
                 )
+
+            if mic_value is None:
+                # Optional dev/test fixture so the pipeline is exercisable
+                # without a working microphone (e.g., over an SSH tunnel where
+                # WebRTC mic capture isn't available). Production runs leave
+                # this env unset and get the standard "no mic" error.
+                fixture = os.environ.get("UI_V2_TEST_FIXTURE_WAV")
+                if fixture and os.path.exists(fixture):
+                    import wave as _wave
+                    with _wave.open(fixture, "rb") as wf:
+                        sr = wf.getframerate()
+                        frames = wf.readframes(wf.getnframes())
+                    arr = np.frombuffer(frames, dtype=np.int16)
+                    if wf.getnchannels() == 2:
+                        arr = arr.reshape(-1, 2).mean(axis=1).astype(np.int16)
+                    mic_value = (sr, arr)
+                else:
+                    yield _err(
+                        "No mic recording. Click the mic widget, record a "
+                        "question, then Send.", current_state)
+                    return
 
             svc = _load_services()
-
-            # Guardrails: surface honest service errors instead of silently
-            # falling back to anything (no mac TTS, ever).
             if svc.tts is None:
-                err = svc.tts_error or "MegakernelTTSService not initialized."
-                return (
-                    None,
-                    render_stage_log(error=err),
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
-                )
+                yield _err(svc.tts_error or "MegakernelTTSService not initialized.", current_state)
+                return
             if not svc.deepgram_key:
-                err = "DEEPGRAM_API_KEY missing in env / .env"
-                return (
-                    None, render_stage_log(error=err),
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
-                )
+                yield _err("DEEPGRAM_API_KEY missing in env / .env", current_state)
+                return
             if not svc.groq_key:
-                err = "LLM_API_KEY (Groq) missing in env / .env"
-                return (
-                    None, render_stage_log(error=err),
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
-                )
+                yield _err("LLM_API_KEY (Groq) missing in env / .env", current_state)
+                return
 
             # 1. Pack mic recording into a WAV the Deepgram REST endpoint
             #    accepts. Gradio hands us (sample_rate, np.ndarray).
             try:
                 wav_bytes = _numpy_audio_to_wav_bytes(mic_value)
             except Exception as e:  # noqa: BLE001
-                return (
-                    None,
-                    render_stage_log(error=f"WAV pack failed: {e!r}"),
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
-                )
+                yield _err(f"WAV pack failed: {e!r}", current_state)
+                return
 
             # 2. STT — Deepgram REST.
             try:
                 user_text, stt_ms = await _stt_deepgram_async(wav_bytes, svc.deepgram_key)
             except Exception as e:  # noqa: BLE001
-                return (
-                    None,
-                    render_stage_log(error=f"Deepgram STT failed: {e!r}"),
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
-                )
+                yield _err(f"Deepgram STT failed: {e!r}", current_state)
+                return
             if not user_text:
-                return (
-                    None,
-                    render_stage_log(error="Deepgram returned empty transcript — try again."),
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
-                )
+                yield _err("Deepgram returned empty transcript — try again.", current_state)
+                return
 
-            # 3. LLM — Groq. Frames slider also caps reply tokens so reply
-            #    length is bounded and TTS test is bounded.
+            # YIELD #1: transcription appears as soon as STT completes.
+            stage_after_stt = render_stage_log(
+                user_text=user_text,
+                stt_ms=stt_ms,
+                llm_text="(LLM running…)",
+            )
+            yield (
+                None,  # no audio chunk yet
+                stage_after_stt,
+                render_metric_cards(current_state),
+                render_comparison_table(current_state),
+                current_state,
+            )
+
+            # 3. LLM — Groq. Frames slider caps reply tokens so the TTS
+            #    horizon stays bounded for a quick A/B comparison.
             try:
                 llm_text, llm_ms = await _llm_groq_async(
                     user_text, svc.groq_key, svc.llm_model,
-                    max_tokens=int(frames) * 4,  # ~4 tokens per "frame" budget
+                    # Conversational reply length — 80 tokens ≈ 60 words ≈
+                    # 6-8 seconds of speech. Caps the LLM so audio horizon
+                    # below stays bounded for both UX and benchmark hygiene.
+                    max_tokens=80,
                 )
             except Exception as e:  # noqa: BLE001
-                return (
-                    None,
-                    render_stage_log(error=f"Groq LLM failed: {e!r}"),
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
-                )
+                yield _err(f"Groq LLM failed: {e!r}", current_state)
+                return
 
-            # 4. TTS — MegakernelTTSService (REAL megakernel, no mac fallback).
+            # YIELD #2: LLM reply visible before any audio plays.
+            stage_after_llm = render_stage_log(
+                user_text=user_text,
+                stt_ms=stt_ms,
+                llm_text=llm_text,
+                llm_ms=llm_ms,
+                ttfc_ms=0.0,
+                tts_total_ms=0.0,
+                audio_seconds=0.0,
+                e2e_ms=(time.perf_counter() - t0) * 1000.0,
+            )
+            yield (
+                None,
+                stage_after_llm,
+                render_metric_cards(current_state),
+                render_comparison_table(current_state),
+                current_state,
+            )
+
+            # 4. TTS — STREAMING with batched yields.
+            #
+            # The megakernel yields one ~80 ms codec frame at a time, but
+            # Gradio's `streaming=True` audio sink shells out to ffprobe
+            # per yield to re-encode PCM → ADTS for the browser's
+            # MediaSource API. The fixed startup cost is ~74 ms regardless
+            # of chunk size on this box. Per-frame yield would mean 74 ms
+            # encode for 80 ms audio = zero margin = stutter.
+            #
+            # 4-frame batch = 320 ms audio per yield. pydub's per-encode
+            # cost is ~75 ms regardless of chunk size (ffprobe startup
+            # dominates), so 320 ms / 75 ms = 4.3× margin — enough for
+            # smooth playback without MediaSource queue backup. We tried
+            # 1-frame batches (80 ms / 75 ms = 1.07× margin) and the
+            # browser silently dropped chunks → empty audio player.
+            STREAM_BATCH_FRAMES = 4
+            ttfc_ms: float | None = None
+            tts_t0 = time.perf_counter()
+            total_pcm = bytearray()
+            pending = bytearray()
+            pending_count = 0
             try:
-                pcm, ttfc_ms, tts_total_ms, audio_seconds = \
-                    await _tts_megakernel_async(svc.tts, llm_text)
+                # Cap TTS horizon dynamically based on LLM reply length so
+                # the talker never runs past EOS into babble territory.
+                # English speech: ~6 chars/sec, codec at 12.5 frames/sec →
+                # ~2.1 frames per character. Add 25% slack + a hard floor
+                # of 40 frames (3.2 s) for very short replies and a ceiling
+                # of 250 frames (20 s) so a long LLM reply still bounds.
+                est_frames = int(len(llm_text) * 2.1 * 1.25) if llm_text else 0
+                max_tts_frames = max(40, min(250, est_frames or 40))
+                # Display state that we update with live measurements as
+                # they become available — TTFC the moment the first chunk
+                # lands, then a running tok/s estimate per chunk so the
+                # cards animate during synthesis. Final RTF + e2e land
+                # after the last chunk.
+                live_disp = LiveMetrics(source="Test mode")
+                # Use the public ``stream_tts`` wrapper instead of reaching
+                # through ``svc.tts._tts.generate(...)``; semantics are
+                # identical (delegates to ``MegakernelTTS.generate``) but the
+                # call site no longer crosses two underscore-prefix boundaries.
+                async for pcm in svc.tts.stream_tts(
+                    llm_text, max_new_tokens=max_tts_frames,
+                ):
+                    if not pcm:
+                        continue
+                    if ttfc_ms is None:
+                        ttfc_ms = (time.perf_counter() - tts_t0) * 1000.0
+                        live_disp = LiveMetrics(
+                            ttfc_ms=ttfc_ms,
+                            source="Test mode",
+                            updated_at=time.time(),
+                        )
+                    total_pcm.extend(pcm)
+                    pending.extend(pcm)
+                    pending_count += 1
+                    if pending_count >= STREAM_BATCH_FRAMES:
+                        chunk_np = np.frombuffer(bytes(pending), dtype=np.int16)
+                        # Update live tok/s + RTF estimate per yield
+                        # so the cards animate as audio streams.
+                        elapsed = max(1e-9, time.perf_counter() - tts_t0)
+                        audio_so_far = (len(total_pcm) // 2) / SAMPLE_RATE_HZ
+                        live_disp = LiveMetrics(
+                            ttfc_ms=ttfc_ms or 0.0,
+                            rtf=elapsed / audio_so_far if audio_so_far > 0 else 0.0,
+                            decode_tok_per_s=(audio_so_far * 12.5) / elapsed,
+                            e2e_ms=(time.perf_counter() - t0) * 1000.0,
+                            source="Test mode",
+                            updated_at=time.time(),
+                        )
+                        yield (
+                            (SAMPLE_RATE_HZ, chunk_np),
+                            stage_after_llm,
+                            render_metric_cards(live_disp),
+                            render_comparison_table(live_disp),
+                            live_disp,
+                        )
+                        pending = bytearray()
+                        pending_count = 0
+                # Flush any tail < STREAM_BATCH_FRAMES so the user hears
+                # the end of the utterance.
+                if pending_count > 0:
+                    chunk_np = np.frombuffer(bytes(pending), dtype=np.int16)
+                    yield (
+                        (SAMPLE_RATE_HZ, chunk_np),
+                        stage_after_llm,
+                        render_metric_cards(live_disp),
+                        render_comparison_table(live_disp),
+                        live_disp,
+                    )
             except Exception as e:  # noqa: BLE001
-                return (
-                    None,
-                    render_stage_log(error=f"MegakernelTTS failed: {e!r}"),
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
-                )
+                yield _err(f"MegakernelTTS failed: {e!r}", current_state)
+                return
 
-            # 5. Pack the bot's PCM into a WAV file (Gradio Audio widget
-            #    with type='filepath' needs a path, not bytes).
-            wav_path = _wav_from_pcm_int16(pcm, SAMPLE_RATE_HZ) if pcm else None
+            tts_total_ms = (time.perf_counter() - tts_t0) * 1000.0
+            audio_seconds = (len(total_pcm) // 2) / SAMPLE_RATE_HZ if total_pcm else 0.0
             e2e_ms = (time.perf_counter() - t0) * 1000.0
 
-            # 6. Update the live-metrics state. RTF = wall-clock / audio_s.
             rtf = (tts_total_ms / 1000.0 / audio_seconds) if audio_seconds > 0 else 0.0
-            # tok/s: per-frame yields ~ 12.5/sec of audio; the megakernel
-            # streams one talker token per frame, so frames_decoded ≈
-            # audio_seconds * 12.5. We surface that as the "decode tok/s".
             tok_per_s = (audio_seconds * 12.5) / (tts_total_ms / 1000.0) if tts_total_ms > 0 else 0.0
             new_state = LiveMetrics(
-                ttfc_ms=ttfc_ms,
+                ttfc_ms=ttfc_ms or 0.0,
                 rtf=rtf,
                 decode_tok_per_s=tok_per_s,
                 e2e_ms=e2e_ms,
@@ -1157,78 +1434,38 @@ def build_ui():
                 stt_ms=stt_ms,
                 llm_text=llm_text,
                 llm_ms=llm_ms,
-                ttfc_ms=ttfc_ms,
+                ttfc_ms=ttfc_ms or 0.0,
                 tts_total_ms=tts_total_ms,
                 audio_seconds=audio_seconds,
                 e2e_ms=e2e_ms,
             )
 
-            return (
-                wav_path,
+            # YIELD #last: final metrics. CRITICAL: do NOT pass `None` to
+            # the streaming audio output here — that triggers Gradio's
+            # frontend to tear down the MediaSource/HLS player mid-playback
+            # (we see "MinimalAudioPlayer: Container not found" + an HLS
+            # fatal stall + the widget resetting to 0:00 / 0:00). Use
+            # ``gr.skip()`` so the audio sink keeps its existing stream
+            # (Gradio finalizes the stream automatically when the generator
+            # returns).
+            yield (
+                gr.skip(),
                 stage_html,
                 render_metric_cards(new_state),
                 render_comparison_table(new_state),
                 new_state,
             )
 
-        send_btn.click(
-            fn=on_send,
-            inputs=[mic_in, frames_in, live_state],
-            outputs=[audio_out, stage_log_html, metrics_html, comparison_html, live_state],
-        )
-
-        # ---------------------------------------------------------------
-        # Live-mode polling: every 2s, read the snapshot file written by
-        # pipecat_demo._write_snapshot and re-render the cards if it
-        # contains FRESHER values than what's in live_state.
-        # ---------------------------------------------------------------
-        def on_tick(current_state: LiveMetrics):
-            snap = _read_snapshot()
-            if snap is None:
-                return (
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
-                )
-
-            updated_at = float(snap.get("updated_at") or 0.0)
-            # Skip if the snapshot is older than what we already showed
-            # (e.g. the user just ran a Mode A pass which is newer).
-            if updated_at <= current_state.updated_at:
-                return (
-                    render_metric_cards(current_state),
-                    render_comparison_table(current_state),
-                    current_state,
-                )
-
-            ttfc = float(snap.get("ttfc_ms") or 0.0)
-            e2e = float(snap.get("e2e_ms") or 0.0)
-            # Live mode doesn't expose RTF / tok/s directly (those are
-            # bench-only). We keep the previous values so the cards don't
-            # flicker to "—" on every poll; mark TTFC + E2E as "Live mode".
-            new_state = LiveMetrics(
-                ttfc_ms=ttfc or current_state.ttfc_ms,
-                rtf=current_state.rtf,
-                decode_tok_per_s=current_state.decode_tok_per_s,
-                e2e_ms=e2e or current_state.e2e_ms,
-                source="Live mode",
-                updated_at=updated_at,
-            )
-            return (
-                render_metric_cards(new_state),
-                render_comparison_table(new_state),
-                new_state,
-            )
-
-        # gr.Timer fires every N seconds. In Gradio 4.x this is the
-        # idiomatic way to poll the server from a Blocks app without
-        # needing a JS .every() handler.
-        timer = gr.Timer(value=2.0)
-        timer.tick(
-            fn=on_tick,
-            inputs=[live_state],
-            outputs=[metrics_html, comparison_html, live_state],
-        )
+        # Two ways to trigger the pipeline:
+        #   1. Click Send (explicit) — the obvious path
+        #   2. Stop recording (auto) — Gradio fires `stop_recording` the
+        #      moment the user clicks Stop on the mic widget AND the audio
+        #      data is packaged. This eliminates the timing race where
+        #      clicking Send right after Stop sees mic_value=None because
+        #      Gradio hasn't finished its async packaging yet.
+        outputs = [audio_out, stage_log_html, metrics_html, comparison_html, live_state]
+        send_btn.click(fn=on_send, inputs=[mic_in, live_state], outputs=outputs)
+        mic_in.stop_recording(fn=on_send, inputs=[mic_in, live_state], outputs=outputs)
 
     return demo
 

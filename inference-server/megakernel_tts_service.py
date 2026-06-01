@@ -134,6 +134,37 @@ class MegakernelTTSService(TTSService):
         """Indicate that this service supports TTFB + usage metrics."""
         return True
 
+    async def stream_tts(
+        self,
+        text: str,
+        *,
+        max_new_tokens: int | None = None,
+    ) -> AsyncGenerator[bytes, None]:
+        """Public streaming wrapper around the underlying megakernel.
+
+        Yields raw int16 LE PCM ``bytes`` at :attr:`sample_rate` Hz, one codec
+        frame (~80 ms) at a time. Use this from non-Pipecat callers (e.g. the
+        Gradio UI) so they don't have to reach through the ``_tts`` private
+        attribute. The Pipecat ``run_tts`` path above is unchanged.
+
+        Args:
+            text: Utterance to synthesize.
+            max_new_tokens: Optional hard cap on Talker decode steps. ``None``
+                falls back to ``MegakernelTTSConfig.max_new_tokens``.
+
+        Yields:
+            ``bytes`` — one codec frame of int16 LE PCM per yield.
+        """
+        async for pcm_bytes in self._tts.generate(
+            text, max_new_tokens=max_new_tokens
+        ):
+            yield pcm_bytes
+
+    @property
+    def source_sample_rate(self) -> int:
+        """Native sample rate of the underlying megakernel (24 kHz)."""
+        return self._source_sample_rate
+
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Synthesize ``text`` and yield ``TTSAudioRawFrame`` per chunk.
